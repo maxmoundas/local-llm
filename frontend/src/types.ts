@@ -19,3 +19,10 @@ export interface HealthStatus {
   status: 'ok' | 'loading'
   model: string | null
 }
+
+export interface AttachedImage {
+  base64: string    // sent to API
+  dataUrl: string   // shown in UI preview and message bubble
+  name: string
+  size: number
+}

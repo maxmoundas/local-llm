@@ -1,12 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { api } from '../api/client'
-import type { Message } from '../types'
+import type { Message, AttachedImage } from '../types'
 import MessageBubble from './Message'
 import InputBar from './InputBar'
 
 interface DisplayMessage extends Message {
   id: string
   streaming?: boolean
+  imageDataUrl?: string
 }
 
 interface Props {
@@ -24,7 +25,6 @@ export default function ChatView({ chatId, modelName, onRename, onChatsChange }:
   const streamingSpanRef = useRef<HTMLSpanElement>(null)
   const accumulatedRef = useRef('')
 
-  // Load chat history on mount
   useEffect(() => {
     api.getChat(chatId).then(chat => {
       setChatName(chat.name)
@@ -36,24 +36,28 @@ export default function ChatView({ chatId, modelName, onRename, onChatsChange }:
     })
   }, [chatId])
 
-  // Scroll to bottom whenever message count changes
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages.length])
 
-  const handleSend = useCallback(async (content: string) => {
+  const handleSend = useCallback(async (content: string, image?: AttachedImage) => {
     if (isGenerating) return
     setIsGenerating(true)
     accumulatedRef.current = ''
 
-    const userMsg: DisplayMessage = { id: `u-${Date.now()}`, role: 'user', content }
+    const userMsg: DisplayMessage = {
+      id: `u-${Date.now()}`,
+      role: 'user',
+      content,
+      imageDataUrl: image?.dataUrl,
+    }
     const streamingMsg: DisplayMessage = {
       id: 'streaming', role: 'assistant', content: '', streaming: true,
     }
     setMessages(prev => [...prev, userMsg, streamingMsg])
 
     try {
-      const res = await api.sendMessage(chatId, content)
+      const res = await api.sendMessage(chatId, content, image?.base64)
       if (!res.ok) throw new Error(`Server error ${res.status}`)
 
       const reader = res.body!.getReader()
@@ -66,7 +70,6 @@ export default function ChatView({ chatId, modelName, onRename, onChatsChange }:
         if (done) break
 
         buffer += decoder.decode(value, { stream: true })
-        // SSE events are separated by double newlines
         const parts = buffer.split('\n\n')
         buffer = parts.pop()!
 
@@ -79,7 +82,6 @@ export default function ChatView({ chatId, modelName, onRename, onChatsChange }:
               const evt = JSON.parse(raw)
               if (evt.type === 'token') {
                 accumulatedRef.current += evt.content
-                // Direct DOM write — bypasses React reconciliation for smooth streaming
                 if (streamingSpanRef.current) {
                   streamingSpanRef.current.textContent = accumulatedRef.current
                   messagesEndRef.current?.scrollIntoView({ behavior: 'instant' })
@@ -95,8 +97,6 @@ export default function ChatView({ chatId, modelName, onRename, onChatsChange }:
       }
 
       const finalContent = accumulatedRef.current
-
-      // Replace the streaming placeholder with the finished, markdown-rendered message
       setMessages(prev => [
         ...prev.filter(m => m.id !== 'streaming'),
         { id: `a-${Date.now()}`, role: 'assistant', content: finalContent },
@@ -153,7 +153,12 @@ export default function ChatView({ chatId, modelName, onRename, onChatsChange }:
               streamingRef={streamingSpanRef}
             />
           ) : (
-            <MessageBubble key={msg.id} role={msg.role as 'user' | 'assistant'} content={msg.content} />
+            <MessageBubble
+              key={msg.id}
+              role={msg.role as 'user' | 'assistant'}
+              content={msg.content}
+              imageDataUrl={msg.imageDataUrl}
+            />
           )
         )}
         <div ref={messagesEndRef} />

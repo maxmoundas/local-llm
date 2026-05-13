@@ -34,7 +34,7 @@ local-llm/
 │   │   ├── chat_store.py  # JSON-file chat persistence
 │   │   ├── config.py      # Config loader (config.yaml + env overrides)
 │   │   └── logger.py      # Rotating file + console logger
-│   ├── tests/             # 46 unit/integration tests (pytest)
+│   ├── tests/             # 77 unit/integration tests (pytest)
 │   ├── scripts/
 │   │   └── download_model.py
 │   ├── config.yaml        # Model and server settings
@@ -185,6 +185,32 @@ data: {"type": "token", "content": "Hello"}
 data: {"type": "done", "name": "Chat title"}
 ```
 
+To send an image with a chat message, include `image_base64` in the request body:
+```python
+import base64, requests
+with open("photo.jpg", "rb") as f:
+    b64 = base64.b64encode(f.read()).decode()
+requests.post(f"http://localhost:8000/api/chats/{chat_id}/messages",
+              json={"content": "What's in this image?", "image_base64": b64})
+```
+
+### Vision endpoint
+
+Single-turn, non-streaming vision inference:
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/v1/vision` | Base64 image + prompt → model response text |
+
+```python
+import base64, requests
+with open("photo.jpg", "rb") as f:
+    b64 = base64.b64encode(f.read()).decode()
+resp = requests.post("http://localhost:8000/v1/vision",
+                     json={"image_base64": b64, "prompt": "Describe this image.", "max_new_tokens": 128})
+print(resp.json()["response"])
+```
+
 ### OpenAI-compatible endpoint
 
 Drop-in replacement for projects already using the OpenAI SDK:
@@ -211,7 +237,7 @@ cd backend
 pytest
 ```
 
-All 46 tests run against mocked model/processor — no GPU required.
+All 77 tests run against mocked model/processor — no GPU required.
 
 ---
 

@@ -6,15 +6,14 @@ import 'highlight.js/styles/github-dark.css'
 interface Props {
   role: 'user' | 'assistant'
   content: string
-  /** When true, content is ignored; the component exposes a ref for direct DOM writes. */
   streaming?: boolean
-  streamingRef?: React.RefObject<HTMLSpanElement | null>
+  streamingRef?: React.Ref<HTMLSpanElement>
+  imageDataUrl?: string
 }
 
-export default function Message({ role, content, streaming, streamingRef }: Props) {
+export default function Message({ role, content, streaming, streamingRef, imageDataUrl }: Props) {
   const endRef = useRef<HTMLDivElement>(null)
 
-  // Auto-scroll when content changes (non-streaming path)
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'instant' })
   }, [content])
@@ -24,6 +23,13 @@ export default function Message({ role, content, streaming, streamingRef }: Prop
       {role === 'assistant' && <div className="avatar">G</div>}
 
       <div className="bubble">
+        {imageDataUrl && role === 'user' && (
+          <img
+            className="bubble-image"
+            src={imageDataUrl}
+            alt="attached"
+          />
+        )}
         {streaming ? (
           <>
             <span ref={streamingRef} />
@@ -34,7 +40,7 @@ export default function Message({ role, content, streaming, streamingRef }: Prop
             {content}
           </ReactMarkdown>
         ) : (
-          content
+          content && <span>{content}</span>
         )}
         <div ref={endRef} />
       </div>

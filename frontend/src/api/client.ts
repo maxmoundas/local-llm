@@ -27,10 +27,10 @@ export const api = {
     fetch(`/api/chats/${id}`, { method: 'DELETE' }).then(() => undefined),
 
   /** Returns the raw Response so the caller can read the SSE body stream. */
-  sendMessage: (id: string, content: string): Promise<Response> =>
+  sendMessage: (id: string, content: string, imageBase64?: string): Promise<Response> =>
     fetch(`/api/chats/${id}/message`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content }),
+      body: JSON.stringify({ content, image_base64: imageBase64 ?? null }),
     }),
 }

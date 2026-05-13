@@ -15,11 +15,15 @@ Endpoints
 """
 from __future__ import annotations
 
+import base64
 import json
 import time
 import uuid
 from contextlib import asynccontextmanager
+from io import BytesIO
 from typing import Any, Literal
+
+from PIL import Image as PILImage
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -93,6 +97,7 @@ class RenameRequest(BaseModel):
 
 class MessageRequest(BaseModel):
     content: str
+    image_base64: str | None = None
 
 
 @app.get("/api/chats")
@@ -127,6 +132,13 @@ async def api_delete_chat(chat_id: str) -> None:
         raise HTTPException(404, "Chat not found")
 
 
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "X-Accel-Buffering": "no",
+    "Connection": "keep-alive",
+}
+
+
 @app.post("/api/chats/{chat_id}/message")
 async def api_send_message(chat_id: str, req: MessageRequest) -> Any:
     llm = _require_loaded()
@@ -136,17 +148,40 @@ async def api_send_message(chat_id: str, req: MessageRequest) -> Any:
 
     chat_store.append_messages(chat_id, "user", req.content)
     messages = _build_messages(chat_store.get_chat(chat_id))
-    logger.info("Chat %s | generating | prompt_tokens≈%d", chat_id[:8], llm.count_tokens(req.content))
 
+    if req.image_base64:
+        logger.info("Chat %s | vision generate | prompt_tokens≈%d", chat_id[:8], llm.count_tokens(req.content))
+        img_bytes = base64.b64decode(req.image_base64)
+        image = PILImage.open(BytesIO(img_bytes)).convert("RGB")
+        return StreamingResponse(
+            _sse_generator_vision(chat_id, image, messages, llm),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+
+    logger.info("Chat %s | generating | prompt_tokens≈%d", chat_id[:8], llm.count_tokens(req.content))
     return StreamingResponse(
         _sse_generator(chat_id, messages, llm),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-transform",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
+        headers=_SSE_HEADERS,
     )
+
+
+def _sse_generator_vision(chat_id: str, image: PILImage.Image, messages: list[dict], llm: LocalLLM):
+    full_response = ""
+    try:
+        for token in llm.stream_with_image(image, messages):
+            full_response += token
+            yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+    except Exception as exc:
+        logger.error("Vision SSE stream error: %s", exc)
+        yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+        return
+
+    chat_store.append_messages(chat_id, "assistant", full_response)
+    updated = chat_store.get_chat(chat_id)
+    logger.info("Vision chat %s | done | completion_tokens≈%d", chat_id[:8], llm.count_tokens(full_response))
+    yield f"data: {json.dumps({'type': 'done', 'name': updated['name']})}\n\n"
 
 
 def _sse_generator(chat_id: str, messages: list[dict], llm: LocalLLM):
@@ -212,6 +247,27 @@ class ModelInfo(BaseModel):
 class ModelListResponse(BaseModel):
     object: str = "list"
     data: list[ModelInfo]
+
+
+class VisionRequest(BaseModel):
+    image_base64: str
+    prompt: str
+    max_new_tokens: int = 128
+
+
+@app.post("/v1/vision")
+def vision_completion(req: VisionRequest) -> dict[str, str]:
+    """Single-turn vision inference: base64 image + prompt → raw model response text.
+
+    FastAPI runs sync route handlers in a thread pool, so this does not block
+    the event loop despite being a blocking GPU call.
+    """
+    llm = _require_loaded()
+    img_bytes = base64.b64decode(req.image_base64)
+    image = PILImage.open(BytesIO(img_bytes)).convert("RGB")
+    response = llm.generate_with_image(image, req.prompt, req.max_new_tokens)
+    logger.info("Vision request complete | response=%s", response[:120])
+    return {"response": response}
 
 
 @app.get("/v1/models", response_model=ModelListResponse)
