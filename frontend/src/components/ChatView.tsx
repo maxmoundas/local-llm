@@ -21,8 +21,8 @@ export default function ChatView({ chatId, modelName, onRename, onChatsChange }:
   const [messages, setMessages] = useState<DisplayMessage[]>([])
   const [chatName, setChatName] = useState('')
   const [isGenerating, setIsGenerating] = useState(false)
+  const [streamingContent, setStreamingContent] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
-  const streamingSpanRef = useRef<HTMLSpanElement>(null)
   const accumulatedRef = useRef('')
 
   useEffect(() => {
@@ -44,6 +44,7 @@ export default function ChatView({ chatId, modelName, onRename, onChatsChange }:
     if (isGenerating) return
     setIsGenerating(true)
     accumulatedRef.current = ''
+    setStreamingContent('')
 
     const userMsg: DisplayMessage = {
       id: `u-${Date.now()}`,
@@ -82,10 +83,7 @@ export default function ChatView({ chatId, modelName, onRename, onChatsChange }:
               const evt = JSON.parse(raw)
               if (evt.type === 'token') {
                 accumulatedRef.current += evt.content
-                if (streamingSpanRef.current) {
-                  streamingSpanRef.current.textContent = accumulatedRef.current
-                  messagesEndRef.current?.scrollIntoView({ behavior: 'instant' })
-                }
+                setStreamingContent(accumulatedRef.current)
               } else if (evt.type === 'done') {
                 finalName = evt.name ?? ''
               } else if (evt.type === 'error') {
@@ -115,6 +113,7 @@ export default function ChatView({ chatId, modelName, onRename, onChatsChange }:
     } finally {
       setIsGenerating(false)
       accumulatedRef.current = ''
+      setStreamingContent('')
       onChatsChange()
     }
   }, [chatId, chatName, isGenerating, onRename, onChatsChange])
@@ -148,9 +147,8 @@ export default function ChatView({ chatId, modelName, onRename, onChatsChange }:
             <MessageBubble
               key="streaming"
               role="assistant"
-              content=""
+              content={streamingContent}
               streaming
-              streamingRef={streamingSpanRef}
             />
           ) : (
             <MessageBubble
