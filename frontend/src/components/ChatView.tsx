@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { api } from '../api/client'
-import type { Message, AttachedImage } from '../types'
+import type { Message, AttachedImage, ModelOption } from '../types'
 import MessageBubble from './Message'
 import InputBar from './InputBar'
+import ModelSelector from './ModelSelector'
 
 interface DisplayMessage extends Message {
   id: string
@@ -12,12 +13,16 @@ interface DisplayMessage extends Message {
 
 interface Props {
   chatId: string
-  modelName: string
+  models: ModelOption[]
+  selectedModelId: string
+  onModelChange: (id: string) => void
   onRename: (chatId: string, name: string) => void
   onChatsChange: () => void
+  onChatLoad: (modelId: string | undefined) => void
+  localModelLoaded: boolean
 }
 
-export default function ChatView({ chatId, modelName, onRename, onChatsChange }: Props) {
+export default function ChatView({ chatId, models, selectedModelId, onModelChange, onRename, onChatsChange, onChatLoad, localModelLoaded }: Props) {
   const [messages, setMessages] = useState<DisplayMessage[]>([])
   const [chatName, setChatName] = useState('')
   const [isGenerating, setIsGenerating] = useState(false)
@@ -33,6 +38,7 @@ export default function ChatView({ chatId, modelName, onRename, onChatsChange }:
           .filter(m => m.role !== 'system')
           .map((m, i) => ({ ...m, id: String(i) }))
       )
+      onChatLoad(chat.model_id)
     })
   }, [chatId])
 
@@ -58,7 +64,7 @@ export default function ChatView({ chatId, modelName, onRename, onChatsChange }:
     setMessages(prev => [...prev, userMsg, streamingMsg])
 
     try {
-      const res = await api.sendMessage(chatId, content, image?.base64)
+      const res = await api.sendMessage(chatId, content, image?.base64, selectedModelId)
       if (!res.ok) throw new Error(`Server error ${res.status}`)
 
       const reader = res.body!.getReader()
@@ -79,17 +85,18 @@ export default function ChatView({ chatId, modelName, onRename, onChatsChange }:
             if (!line.startsWith('data: ')) continue
             const raw = line.slice(6).trim()
             if (!raw) continue
+            let evt: { type: string; content?: string; name?: string; message?: string }
             try {
-              const evt = JSON.parse(raw)
-              if (evt.type === 'token') {
-                accumulatedRef.current += evt.content
-                setStreamingContent(accumulatedRef.current)
-              } else if (evt.type === 'done') {
-                finalName = evt.name ?? ''
-              } else if (evt.type === 'error') {
-                throw new Error(evt.message)
-              }
-            } catch { /* malformed SSE line — skip */ }
+              evt = JSON.parse(raw)
+            } catch { continue /* malformed SSE line — skip */ }
+            if (evt.type === 'token') {
+              accumulatedRef.current += evt.content ?? ''
+              setStreamingContent(accumulatedRef.current)
+            } else if (evt.type === 'done') {
+              finalName = evt.name ?? ''
+            } else if (evt.type === 'error') {
+              throw new Error(evt.message ?? 'Unknown error from server')
+            }
           }
         }
       }
@@ -116,7 +123,7 @@ export default function ChatView({ chatId, modelName, onRename, onChatsChange }:
       setStreamingContent('')
       onChatsChange()
     }
-  }, [chatId, chatName, isGenerating, onRename, onChatsChange])
+  }, [chatId, chatName, isGenerating, selectedModelId, onRename, onChatsChange])
 
   const handleTitleChange = (e: React.FocusEvent<HTMLInputElement>) => {
     const name = e.target.value.trim() || chatName
@@ -138,7 +145,12 @@ export default function ChatView({ chatId, modelName, onRename, onChatsChange }:
           onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur() }}
           title="Click to rename"
         />
-        <span className="model-badge">{modelName}</span>
+        <ModelSelector
+          models={models}
+          selected={selectedModelId}
+          onChange={onModelChange}
+          localModelLoaded={localModelLoaded}
+        />
       </div>
 
       <div className="messages">

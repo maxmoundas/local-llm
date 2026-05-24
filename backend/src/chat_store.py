@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,8 +39,16 @@ def _preview(messages: list[dict]) -> str:
 
 
 def _auto_name(first_user_msg: str) -> str:
-    name = first_user_msg.strip()[:45]
-    return (name + "…") if len(first_user_msg.strip()) > 45 else name
+    text = first_user_msg.strip()
+    # Use the first sentence if it fits cleanly
+    m = re.search(r'[.?!](?:\s|$)', text)
+    if m and m.end() <= 60:
+        return text[:m.end()].strip()
+    # Otherwise truncate at a word boundary
+    if len(text) > 45:
+        truncated = text[:46].rsplit(' ', 1)[0].rstrip(',.;:')
+        return truncated + '…'
+    return text
 
 
 # ------------------------------------------------------------------
@@ -59,6 +68,8 @@ def list_chats() -> list[dict]:
                 "created_at": data["created_at"],
                 "updated_at": data["updated_at"],
                 "preview": _preview(data.get("messages", [])),
+                "model_id": data.get("model_id"),
+                "pinned": data.get("pinned", False),
             })
         except Exception:
             pass
@@ -91,15 +102,27 @@ def rename_chat(chat_id: str, name: str) -> dict | None:
     return chat
 
 
-def append_messages(chat_id: str, role: str, content: str) -> dict | None:
+def append_messages(chat_id: str, role: str, content: str, model_id: str | None = None) -> dict | None:
     chat = _read(chat_id)
     if chat is None:
         return None
     chat["messages"].append({"role": role, "content": content})
     chat["updated_at"] = _now()
-    # Auto-name on the first user message
-    if role == "user" and chat["name"] == "New Chat":
-        chat["name"] = _auto_name(content)
+    if role == "user":
+        if model_id:
+            chat["model_id"] = model_id
+        if chat["name"] == "New Chat":
+            chat["name"] = _auto_name(content)
+    _write(chat)
+    return chat
+
+
+def toggle_pin(chat_id: str) -> dict | None:
+    chat = _read(chat_id)
+    if chat is None:
+        return None
+    chat["pinned"] = not chat.get("pinned", False)
+    chat["updated_at"] = _now()
     _write(chat)
     return chat
 

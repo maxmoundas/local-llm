@@ -1,4 +1,4 @@
-import type { Chat, ChatDetail, HealthStatus } from '../types'
+import type { Chat, ChatDetail, HealthStatus, ModelOption } from '../types'
 
 // All paths are relative — Vite proxies /api/* and /health to :8000 in dev.
 // In a built+served-from-FastAPI setup they hit the same origin.
@@ -6,6 +6,9 @@ import type { Chat, ChatDetail, HealthStatus } from '../types'
 export const api = {
   health: (): Promise<HealthStatus> =>
     fetch('/health').then(r => r.json()),
+
+  listModels: (): Promise<ModelOption[]> =>
+    fetch('/api/models').then(r => r.json()),
 
   listChats: (): Promise<Chat[]> =>
     fetch('/api/chats').then(r => r.json()),
@@ -26,11 +29,14 @@ export const api = {
   deleteChat: (id: string): Promise<void> =>
     fetch(`/api/chats/${id}`, { method: 'DELETE' }).then(() => undefined),
 
+  pinChat: (id: string): Promise<{ pinned: boolean }> =>
+    fetch(`/api/chats/${id}/pin`, { method: 'POST' }).then(r => r.json()),
+
   /** Returns the raw Response so the caller can read the SSE body stream. */
-  sendMessage: (id: string, content: string, imageBase64?: string): Promise<Response> =>
+  sendMessage: (id: string, content: string, imageBase64?: string, modelId?: string): Promise<Response> =>
     fetch(`/api/chats/${id}/message`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content, image_base64: imageBase64 ?? null }),
+      body: JSON.stringify({ content, image_base64: imageBase64 ?? null, model_id: modelId ?? null }),
     }),
 }

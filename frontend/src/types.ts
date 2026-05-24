@@ -4,6 +4,8 @@ export interface Chat {
   created_at: string
   updated_at: string
   preview: string
+  model_id?: string
+  pinned: boolean
 }
 
 export interface Message {
@@ -13,11 +15,19 @@ export interface Message {
 
 export interface ChatDetail extends Chat {
   messages: Message[]
+  model_id?: string
 }
 
 export interface HealthStatus {
   status: 'ok' | 'loading'
   model: string | null
+  local_model_loaded: boolean
+}
+
+export interface ModelOption {
+  id: string
+  name: string
+  provider: string
 }
 
 export interface AttachedImage {

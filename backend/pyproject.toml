@@ -12,6 +12,13 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 log_cli = true
 log_cli_level = "WARNING"
+markers = [
+    "integration: hits real external APIs (requires API keys in .env)",
+]
+filterwarnings = [
+    "ignore:builtin type.*has no __module__:DeprecationWarning",
+]
+tmp_path_retention_policy = "none"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -4,26 +4,24 @@ FastAPI backend — serves the LLM inference API.
 Endpoints
 ─────────
   GET  /health
+  GET  /api/models
   GET  /api/chats
   POST /api/chats
   GET  /api/chats/{id}
   PATCH /api/chats/{id}
   DELETE /api/chats/{id}
   POST /api/chats/{id}/message   ← SSE streaming response
-  GET  /v1/models                ← OpenAI-compat (pipe into other projects)
+  GET  /v1/models                ← OpenAI-compat
   POST /v1/chat/completions      ← OpenAI-compat
 """
 from __future__ import annotations
 
-import base64
 import json
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from io import BytesIO
 from typing import Any, Literal
-
-from PIL import Image as PILImage
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -35,9 +33,11 @@ from src import chat_store
 from src.config import load_config
 from src.logger import get_logger, setup_logging
 from src.model import LocalLLM
+from src.providers import BaseProvider, ProviderRegistry, build_registry
 
 logger = get_logger(__name__)
 _llm: LocalLLM | None = None
+_registry: ProviderRegistry | None = None
 
 DEFAULT_SYSTEM = (
     "You are a helpful, accurate, and thoughtful AI assistant. "
@@ -47,13 +47,14 @@ DEFAULT_SYSTEM = (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _llm
+    global _llm, _registry
     cfg = load_config()
     setup_logging(cfg)
     logger.info("Starting backend")
     _llm = LocalLLM(cfg)
-    _llm.load()
-    logger.info("Model ready — backend listening")
+    _registry = build_registry(_llm)
+    logger.info("Server ready — cloud providers available; local model loading in background")
+    threading.Thread(target=_llm.load, daemon=True, name="model-loader").start()
     yield
 
 
@@ -69,10 +70,16 @@ app.add_middleware(
 
 # ── Helpers ────────────────────────────────────────────────────────────
 
-def _require_loaded() -> LocalLLM:
+def _require_llm() -> LocalLLM:
     if _llm is None or not _llm.is_loaded:
         raise HTTPException(503, "Model not loaded yet — try again in a moment")
     return _llm
+
+
+def _require_registry() -> ProviderRegistry:
+    if _registry is None:
+        raise HTTPException(503, "Server not ready — try again in a moment")
+    return _registry
 
 
 def _build_messages(chat: dict) -> list[dict]:
@@ -82,12 +89,22 @@ def _build_messages(chat: dict) -> list[dict]:
     return msgs
 
 
-# ── Health ─────────────────────────────────────────────────────────────
+# ── Health & model discovery ───────────────────────────────────────────
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
     loaded = _llm is not None and _llm.is_loaded
-    return {"status": "ok" if loaded else "loading", "model": _llm.repo_id if _llm else None}
+    return {
+        "status": "ok" if loaded else "loading",
+        "model": _llm.repo_id if _llm else None,
+        "local_model_loaded": loaded,
+    }
+
+
+@app.get("/api/models")
+async def api_list_models() -> list[dict]:
+    registry = _require_registry()
+    return [{"id": m.id, "name": m.name, "provider": m.provider} for m in registry.list_models()]
 
 
 # ── Chat management (/api/chats/*) ─────────────────────────────────────
@@ -95,9 +112,11 @@ async def health() -> dict[str, Any]:
 class RenameRequest(BaseModel):
     name: str
 
+
 class MessageRequest(BaseModel):
     content: str
     image_base64: str | None = None
+    model_id: str | None = None
 
 
 @app.get("/api/chats")
@@ -132,6 +151,14 @@ async def api_delete_chat(chat_id: str) -> None:
         raise HTTPException(404, "Chat not found")
 
 
+@app.post("/api/chats/{chat_id}/pin")
+async def api_toggle_pin(chat_id: str) -> dict:
+    chat = chat_store.toggle_pin(chat_id)
+    if chat is None:
+        raise HTTPException(404, "Chat not found")
+    return {"pinned": chat.get("pinned", False)}
+
+
 _SSE_HEADERS = {
     "Cache-Control": "no-cache, no-transform",
     "X-Accel-Buffering": "no",
@@ -141,68 +168,48 @@ _SSE_HEADERS = {
 
 @app.post("/api/chats/{chat_id}/message")
 async def api_send_message(chat_id: str, req: MessageRequest) -> Any:
-    llm = _require_loaded()
+    registry = _require_registry()
     chat = chat_store.get_chat(chat_id)
     if chat is None:
         raise HTTPException(404, "Chat not found")
 
-    chat_store.append_messages(chat_id, "user", req.content)
+    model_id = req.model_id or registry.default_model_id
+    try:
+        provider = registry.get_provider(model_id)
+    except KeyError:
+        raise HTTPException(400, f"Unknown model: {model_id}")
+
+    chat_store.append_messages(chat_id, "user", req.content, model_id=model_id)
     messages = _build_messages(chat_store.get_chat(chat_id))
 
-    if req.image_base64:
-        logger.info("Chat %s | vision generate | prompt_tokens≈%d", chat_id[:8], llm.count_tokens(req.content))
-        img_bytes = base64.b64decode(req.image_base64)
-        image = PILImage.open(BytesIO(img_bytes)).convert("RGB")
-        return StreamingResponse(
-            _sse_generator_vision(chat_id, image, messages, llm),
-            media_type="text/event-stream",
-            headers=_SSE_HEADERS,
-        )
-
-    logger.info("Chat %s | generating | prompt_tokens≈%d", chat_id[:8], llm.count_tokens(req.content))
+    logger.info("Chat %s | model=%s | prompt_tokens≈%d", chat_id[:8], model_id, provider.count_tokens(req.content))
     return StreamingResponse(
-        _sse_generator(chat_id, messages, llm),
+        _sse_generator(chat_id, messages, provider, model_id, req.image_base64),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )
 
 
-def _sse_generator_vision(chat_id: str, image: PILImage.Image, messages: list[dict], llm: LocalLLM):
+def _sse_generator(
+    chat_id: str,
+    messages: list[dict],
+    provider: BaseProvider,
+    model_id: str,
+    image_base64: str | None = None,
+):
     full_response = ""
     try:
-        for token in llm.stream_with_image(image, messages):
+        for token in provider.stream(messages, model_id, image_base64=image_base64):
             full_response += token
             yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
     except Exception as exc:
-        logger.error("Vision SSE stream error: %s", exc)
+        logger.error("SSE stream error [%s]: %s", model_id, exc)
         yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
         return
 
     chat_store.append_messages(chat_id, "assistant", full_response)
     updated = chat_store.get_chat(chat_id)
-    logger.info("Vision chat %s | done | completion_tokens≈%d", chat_id[:8], llm.count_tokens(full_response))
-    yield f"data: {json.dumps({'type': 'done', 'name': updated['name']})}\n\n"
-
-
-def _sse_generator(chat_id: str, messages: list[dict], llm: LocalLLM):
-    """
-    Sync generator — Starlette's StreamingResponse runs this in a thread pool,
-    so blocking queue.get() calls inside llm.stream() don't block the event loop.
-    Each yielded chunk is flushed immediately to the client.
-    """
-    full_response = ""
-    try:
-        for token in llm.stream(messages):
-            full_response += token
-            yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
-    except Exception as exc:
-        logger.error("SSE stream error: %s", exc)
-        yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
-        return
-
-    chat_store.append_messages(chat_id, "assistant", full_response)
-    updated = chat_store.get_chat(chat_id)
-    logger.info("Chat %s | done | completion_tokens≈%d", chat_id[:8], llm.count_tokens(full_response))
+    logger.info("Chat %s | done | model=%s | tokens≈%d", chat_id[:8], model_id, provider.count_tokens(full_response))
     yield f"data: {json.dumps({'type': 'done', 'name': updated['name']})}\n\n"
 
 
@@ -212,6 +219,7 @@ class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
 
+
 class ChatCompletionRequest(BaseModel):
     model: str = "local"
     messages: list[ChatMessage]
@@ -220,15 +228,18 @@ class ChatCompletionRequest(BaseModel):
     top_p: float | None = None
     stream: bool = False
 
+
 class Usage(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
 
+
 class Choice(BaseModel):
     index: int
     message: ChatMessage
     finish_reason: str = "stop"
+
 
 class ChatCompletionResponse(BaseModel):
     id: str
@@ -238,15 +249,17 @@ class ChatCompletionResponse(BaseModel):
     choices: list[Choice]
     usage: Usage
 
-class ModelInfo(BaseModel):
+
+class OAIModelInfo(BaseModel):
     id: str
     object: str = "model"
     created: int
     owned_by: str = "local"
 
-class ModelListResponse(BaseModel):
+
+class OAIModelListResponse(BaseModel):
     object: str = "list"
-    data: list[ModelInfo]
+    data: list[OAIModelInfo]
 
 
 class VisionRequest(BaseModel):
@@ -257,12 +270,10 @@ class VisionRequest(BaseModel):
 
 @app.post("/v1/vision")
 def vision_completion(req: VisionRequest) -> dict[str, str]:
-    """Single-turn vision inference: base64 image + prompt → raw model response text.
-
-    FastAPI runs sync route handlers in a thread pool, so this does not block
-    the event loop despite being a blocking GPU call.
-    """
-    llm = _require_loaded()
+    import base64
+    from io import BytesIO
+    from PIL import Image as PILImage
+    llm = _require_llm()
     img_bytes = base64.b64decode(req.image_base64)
     image = PILImage.open(BytesIO(img_bytes)).convert("RGB")
     response = llm.generate_with_image(image, req.prompt, req.max_new_tokens)
@@ -270,15 +281,15 @@ def vision_completion(req: VisionRequest) -> dict[str, str]:
     return {"response": response}
 
 
-@app.get("/v1/models", response_model=ModelListResponse)
-async def list_models() -> ModelListResponse:
-    llm = _require_loaded()
-    return ModelListResponse(data=[ModelInfo(id=llm.repo_id, created=int(time.time()))])
+@app.get("/v1/models", response_model=OAIModelListResponse)
+async def list_models() -> OAIModelListResponse:
+    llm = _require_llm()
+    return OAIModelListResponse(data=[OAIModelInfo(id=llm.repo_id, created=int(time.time()))])
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest) -> Any:
-    llm = _require_loaded()
+    llm = _require_llm()
     messages = [m.model_dump() for m in req.messages]
 
     if req.stream:

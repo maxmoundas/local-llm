@@ -131,8 +131,11 @@ export default function InputBar({ onSend, disabled }: Props) {
         <textarea
           ref={textareaRef}
           className="user-input"
-          placeholder="Message Gemma… (paste an image or attach one)"
+          placeholder="Message… (paste or attach an image)"
           rows={1}
+          autoComplete="off"
+          autoCorrect="off"
+          spellCheck={false}
           onKeyDown={handleKeyDown}
           onInput={handleInput}
           onPaste={handlePaste}

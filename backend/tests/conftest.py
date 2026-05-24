@@ -64,7 +64,17 @@ def mock_llm(cfg) -> LocalLLM:
 
 
 @pytest.fixture
-def test_client(mock_llm) -> TestClient:
+def mock_registry(mock_llm):
+    from src.providers.local import LocalProvider
+    from src.providers.registry import ProviderRegistry
+    registry = ProviderRegistry()
+    registry.register(LocalProvider(mock_llm))
+    return registry
+
+
+@pytest.fixture
+def test_client(mock_llm, mock_registry) -> TestClient:
     from src import server
     server._llm = mock_llm
+    server._registry = mock_registry
     return TestClient(server.app)

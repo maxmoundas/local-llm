@@ -8,6 +8,10 @@ huggingface_hub>=0.25.0
 sentencepiece>=0.2.0
 protobuf>=4.0.0
 
+# Cloud providers (registered automatically when API keys are present in .env)
+anthropic>=0.40.0
+openai>=1.50.0
+
 # Server
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
