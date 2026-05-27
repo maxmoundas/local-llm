@@ -9,7 +9,7 @@ from src.providers.base import BaseProvider, ModelOption
 _MODELS = [
     # ModelOption(id="gpt-5.5", name="GPT-5.5", provider="openai"),      # expensive — uncomment to re-enable
     # ModelOption(id="gpt-5.5-pro", name="GPT-5.5 Pro", provider="openai"),  # expensive — uncomment to re-enable
-    ModelOption(id="gpt-5.4-mini", name="GPT-5.4 Mini", provider="openai"),
+    ModelOption(id="gpt-5.4-mini", name="GPT-5.4 Mini", provider="openai", is_cheapest=True),
 ]
 
 
@@ -46,3 +46,12 @@ class OpenAIProvider(BaseProvider):
             delta = chunk.choices[0].delta
             if delta.content:
                 yield delta.content
+
+    def complete(self, messages: list[dict], model_id: str) -> str:
+        oai_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
+        response = self._client.chat.completions.create(
+            model=model_id,
+            messages=oai_messages,
+            stream=False,
+        )
+        return response.choices[0].message.content or ""

@@ -65,6 +65,7 @@ class TestBaseProviderDefaults:
             @property
             def models(self): return []
             def stream(self, messages, model_id, image_base64=None): return iter([])
+            def complete(self, messages, model_id): return ""
 
         p = MinimalProvider()
         assert p.count_tokens("hello world") > 0
@@ -92,6 +93,11 @@ class TestLocalProvider:
         p = LocalProvider(mock_llm)
         assert "/" not in p.models[0].name
 
+    def test_is_cheapest_true(self, mock_llm):
+        from src.providers.local import LocalProvider
+        p = LocalProvider(mock_llm)
+        assert p.models[0].is_cheapest is True
+
     def test_stream_delegates_to_llm(self, mock_llm):
         from src.providers.local import LocalProvider
         mock_llm.stream = MagicMock(return_value=iter(["hi", " there"]))
@@ -99,6 +105,21 @@ class TestLocalProvider:
         tokens = list(p.stream([{"role": "user", "content": "hello"}], mock_llm.repo_id))
         assert tokens == ["hi", " there"]
         mock_llm.stream.assert_called_once()
+
+    def test_complete_delegates_to_llm(self, mock_llm):
+        from src.providers.local import LocalProvider
+        mock_llm.generate = MagicMock(return_value="Generated text")
+        p = LocalProvider(mock_llm)
+        result = p.complete([{"role": "user", "content": "hello"}], mock_llm.repo_id)
+        assert result == "Generated text"
+        mock_llm.generate.assert_called_once()
+
+    def test_complete_raises_when_not_loaded(self, mock_llm):
+        from src.providers.local import LocalProvider
+        mock_llm.model = None  # mark as not loaded
+        p = LocalProvider(mock_llm)
+        with pytest.raises(RuntimeError, match="still loading"):
+            p.complete([{"role": "user", "content": "hello"}], mock_llm.repo_id)
 
     def test_stream_with_image_calls_vision(self, mock_llm):
         from src.providers.local import LocalProvider
@@ -215,6 +236,58 @@ class TestAnthropicProvider:
             img_block = next(b for b in call_kwargs["messages"][-1]["content"] if b["type"] == "image")
             assert img_block["source"]["media_type"] == "image/png"
 
+    def test_haiku_is_cheapest(self):
+        with patch("anthropic.Anthropic"):
+            from src.providers.anthropic_provider import AnthropicProvider
+            p = AnthropicProvider("test-key")
+            haiku = next(m for m in p.models if "haiku" in m.id)
+            assert haiku.is_cheapest is True
+
+    def test_non_haiku_models_not_cheapest(self):
+        with patch("anthropic.Anthropic"):
+            from src.providers.anthropic_provider import AnthropicProvider
+            p = AnthropicProvider("test-key")
+            others = [m for m in p.models if "haiku" not in m.id]
+            assert all(not m.is_cheapest for m in others)
+
+    def test_complete_returns_text(self):
+        with patch("anthropic.Anthropic") as mock_cls:
+            from src.providers.anthropic_provider import AnthropicProvider
+            mock_msg = MagicMock()
+            mock_msg.content = [MagicMock(text="Short answer")]
+            mock_cls.return_value.messages.create.return_value = mock_msg
+            p = AnthropicProvider("test-key")
+            result = p.complete([{"role": "user", "content": "hi"}], "claude-haiku-4-5-20251001")
+            assert result == "Short answer"
+
+    def test_complete_separates_system_message(self):
+        with patch("anthropic.Anthropic") as mock_cls:
+            from src.providers.anthropic_provider import AnthropicProvider
+            mock_msg = MagicMock()
+            mock_msg.content = [MagicMock(text="ok")]
+            mock_cls.return_value.messages.create.return_value = mock_msg
+            p = AnthropicProvider("test-key")
+            messages = [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "hello"},
+            ]
+            p.complete(messages, "claude-haiku-4-5-20251001")
+            call_kwargs = mock_cls.return_value.messages.create.call_args.kwargs
+            assert call_kwargs["system"] == "Be brief."
+            assert all(m["role"] != "system" for m in call_kwargs["messages"])
+
+    def test_complete_uses_non_streaming_api(self):
+        with patch("anthropic.Anthropic") as mock_cls:
+            from src.providers.anthropic_provider import AnthropicProvider
+            mock_msg = MagicMock()
+            mock_msg.content = [MagicMock(text="ok")]
+            mock_cls.return_value.messages.create.return_value = mock_msg
+            p = AnthropicProvider("test-key")
+            p.complete([{"role": "user", "content": "hi"}], "claude-haiku-4-5-20251001")
+            # create() not stream() should be called
+            mock_cls.return_value.messages.create.assert_called_once()
+            mock_cls.return_value.messages.stream.assert_not_called()
+
     def test_uses_api_key(self):
         with patch("anthropic.Anthropic") as mock_cls:
             from src.providers.anthropic_provider import AnthropicProvider
@@ -310,6 +383,34 @@ class TestOpenAIProvider:
             tokens = list(p.stream([{"role": "user", "content": "hi"}], "gpt-5.4-mini"))
             assert tokens == ["hello"]
 
+    def test_gpt_mini_is_cheapest(self):
+        with patch("openai.OpenAI"):
+            from src.providers.openai_provider import OpenAIProvider
+            p = OpenAIProvider("test-key")
+            mini = next(m for m in p.models if "mini" in m.id)
+            assert mini.is_cheapest is True
+
+    def test_complete_returns_text(self):
+        with patch("src.providers.openai_provider.OpenAI") as mock_cls:
+            from src.providers.openai_provider import OpenAIProvider
+            mock_response = MagicMock()
+            mock_response.choices[0].message.content = "Short answer"
+            mock_cls.return_value.chat.completions.create.return_value = mock_response
+            p = OpenAIProvider("test-key")
+            result = p.complete([{"role": "user", "content": "hi"}], "gpt-5.4-mini")
+            assert result == "Short answer"
+
+    def test_complete_uses_non_streaming_api(self):
+        with patch("src.providers.openai_provider.OpenAI") as mock_cls:
+            from src.providers.openai_provider import OpenAIProvider
+            mock_response = MagicMock()
+            mock_response.choices[0].message.content = "ok"
+            mock_cls.return_value.chat.completions.create.return_value = mock_response
+            p = OpenAIProvider("test-key")
+            p.complete([{"role": "user", "content": "hi"}], "gpt-5.4-mini")
+            call_kwargs = mock_cls.return_value.chat.completions.create.call_args.kwargs
+            assert call_kwargs["stream"] is False
+
     def test_uses_api_key(self):
         with patch("src.providers.openai_provider.OpenAI") as mock_cls:
             from src.providers.openai_provider import OpenAIProvider
@@ -320,13 +421,18 @@ class TestOpenAIProvider:
 # ── ProviderRegistry ───────────────────────────────────────────────────
 
 class TestProviderRegistry:
-    def _make_provider(self, provider_name: str, model_ids: list[str]) -> BaseProvider:
+    def _make_provider(self, provider_name: str, model_ids: list[str], cheapest: str | None = None) -> BaseProvider:
         class FakeProvider(BaseProvider):
             @property
             def provider_name(self): return provider_name
             @property
-            def models(self): return [ModelOption(id=m, name=m, provider=provider_name) for m in model_ids]
+            def models(self):
+                return [
+                    ModelOption(id=m, name=m, provider=provider_name, is_cheapest=(m == cheapest))
+                    for m in model_ids
+                ]
             def stream(self, messages, model_id, image_base64=None): return iter([])
+            def complete(self, messages, model_id): return "ok"
         return FakeProvider()
 
     def test_register_and_list(self):
@@ -369,6 +475,28 @@ class TestProviderRegistry:
         registry.register(self._make_provider("b", ["m2"]))
         registry.register(self._make_provider("c", ["m3"]))
         assert [m.id for m in registry.list_models()] == ["m1", "m2", "m3"]
+
+    def test_cheapest_model_returns_flagged_model(self):
+        registry = ProviderRegistry()
+        registry.register(self._make_provider("test", ["m1", "m2"], cheapest="m2"))
+        assert registry.cheapest_model.id == "m2"
+
+    def test_cheapest_model_returns_first_flagged_across_providers(self):
+        registry = ProviderRegistry()
+        registry.register(self._make_provider("first", ["a"], cheapest="a"))
+        registry.register(self._make_provider("second", ["b"], cheapest="b"))
+        # Registration order: first provider's cheapest wins
+        assert registry.cheapest_model.id == "a"
+
+    def test_cheapest_model_falls_back_to_default_when_none_flagged(self):
+        registry = ProviderRegistry()
+        registry.register(self._make_provider("test", ["m1", "m2"]))  # none marked cheapest
+        assert registry.cheapest_model.id == "m1"  # first model of first provider
+
+    def test_cheapest_model_is_cheapest_flag_set(self):
+        registry = ProviderRegistry()
+        registry.register(self._make_provider("test", ["cheap", "expensive"], cheapest="cheap"))
+        assert registry.cheapest_model.is_cheapest is True
 
 
 # ── build_registry ─────────────────────────────────────────────────────

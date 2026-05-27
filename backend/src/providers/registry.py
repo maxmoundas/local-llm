@@ -27,6 +27,19 @@ class ProviderRegistry:
     def default_model_id(self) -> str:
         return self._providers[0].models[0].id
 
+    @property
+    def cheapest_model(self) -> ModelOption:
+        """Return the first model flagged is_cheapest=True, or the default model as fallback.
+
+        Providers are registered in order: local → anthropic → openai, so cloud cheap
+        models (haiku, gpt-mini) are preferred over local when both are available.
+        """
+        for provider in self._providers:
+            for model in provider.models:
+                if model.is_cheapest:
+                    return model
+        return self._providers[0].models[0]
+
 
 def build_registry(llm) -> ProviderRegistry:
     """Auto-discover providers based on available API keys and the local model."""

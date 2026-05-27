@@ -4,6 +4,7 @@ import type { Chat, ModelOption } from './types'
 import Sidebar from './components/Sidebar'
 import ChatView from './components/ChatView'
 import EmptyState from './components/EmptyState'
+import SettingsView from './components/SettingsView'
 
 export default function App() {
   const [chats, setChats] = useState<Chat[]>([])
@@ -11,6 +12,7 @@ export default function App() {
   const [models, setModels] = useState<ModelOption[]>([])
   const [selectedModelId, setSelectedModelId] = useState<string>('')
   const [localModelLoaded, setLocalModelLoaded] = useState(false)
+  const [view, setView] = useState<'chat' | 'settings'>('chat')
 
   useEffect(() => {
     api.listModels().then(ms => {
@@ -69,16 +71,28 @@ export default function App() {
     await refreshChats()
   }, [refreshChats])
 
+  const handleSelectChat = useCallback((id: string) => {
+    setCurrentChatId(id)
+    setView('chat')
+  }, [])
+
+  const handleCreateChat = useCallback(async () => {
+    await createChat()
+    setView('chat')
+  }, [createChat])
+
   return (
     <div className="app">
       <Sidebar
         chats={chats}
         currentChatId={currentChatId}
-        onSelect={setCurrentChatId}
-        onCreate={createChat}
+        onSelect={handleSelectChat}
+        onCreate={handleCreateChat}
         onDelete={deleteChat}
         onRename={handleRename}
         onPin={handlePin}
+        onSettings={() => setView(v => v === 'settings' ? 'chat' : 'settings')}
+        settingsActive={view === 'settings'}
       />
       <main className="main">
         {!localModelLoaded && (
@@ -87,7 +101,9 @@ export default function App() {
             Local model loading — Anthropic &amp; OpenAI models are available now
           </div>
         )}
-        {currentChatId ? (
+        {view === 'settings' ? (
+          <SettingsView />
+        ) : currentChatId ? (
           <ChatView
             key={currentChatId}
             chatId={currentChatId}

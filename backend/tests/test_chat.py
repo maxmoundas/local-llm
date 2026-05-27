@@ -100,18 +100,21 @@ class TestAppendMessages:
         messages = cs.get_chat(chat["id"])["messages"]
         assert messages[-1]["role"] == "assistant"
 
-    def test_auto_names_on_first_user_message(self):
+    def test_name_stays_new_chat_after_first_user_message(self):
+        # Auto-naming moved to LLMService.generate_title(); append_messages is name-neutral.
         chat = cs.create_chat()
         cs.append_messages(chat["id"], "user", "Tell me about Python")
-        assert cs.get_chat(chat["id"])["name"] == "Tell me about Python"
+        assert cs.get_chat(chat["id"])["name"] == "New Chat"
 
-    def test_auto_name_truncates_long_message(self):
+    def test_model_id_stored_on_user_message(self):
         chat = cs.create_chat()
-        long_msg = "a" * 60
-        cs.append_messages(chat["id"], "user", long_msg)
-        name = cs.get_chat(chat["id"])["name"]
-        assert name.endswith("…")
-        assert len(name) <= 46
+        cs.append_messages(chat["id"], "user", "hello", model_id="my-model")
+        assert cs.get_chat(chat["id"])["model_id"] == "my-model"
+
+    def test_model_id_not_stored_for_assistant_message(self):
+        chat = cs.create_chat()
+        cs.append_messages(chat["id"], "assistant", "hi", model_id="my-model")
+        assert "model_id" not in cs.get_chat(chat["id"])
 
     def test_does_not_rename_if_already_named(self):
         chat = cs.create_chat()

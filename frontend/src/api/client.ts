@@ -1,4 +1,4 @@
-import type { Chat, ChatDetail, HealthStatus, ModelOption } from '../types'
+import type { AppSettings, Chat, ChatDetail, HealthStatus, MemoryData, ModelOption } from '../types'
 
 // All paths are relative — Vite proxies /api/* and /health to :8000 in dev.
 // In a built+served-from-FastAPI setup they hit the same origin.
@@ -39,4 +39,24 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content, image_base64: imageBase64 ?? null, model_id: modelId ?? null }),
     }),
+
+  getSettings: (): Promise<AppSettings> =>
+    fetch('/api/settings').then(r => r.json()),
+
+  updateSettings: (data: Partial<Omit<AppSettings, 'models'>>): Promise<AppSettings> =>
+    fetch('/api/settings', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    }).then(r => r.json()),
+
+  getMemory: (): Promise<MemoryData> =>
+    fetch('/api/memory').then(r => r.json()),
+
+  updateMemory: (content: string): Promise<MemoryData> =>
+    fetch('/api/memory', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+    }).then(r => r.json()),
 }

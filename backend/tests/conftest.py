@@ -75,6 +75,8 @@ def mock_registry(mock_llm):
 @pytest.fixture
 def test_client(mock_llm, mock_registry) -> TestClient:
     from src import server
+    from src.llm_service import LLMService
     server._llm = mock_llm
     server._registry = mock_registry
+    server._llm_service = LLMService(mock_registry)
     return TestClient(server.app)

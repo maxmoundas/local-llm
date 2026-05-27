@@ -76,6 +76,33 @@ def _stream_or_skip(provider_name: str, provider, messages, model_id, **kwargs) 
     return tokens, "".join(tokens)
 
 
+def _complete_or_skip(provider_name: str, provider, messages, model_id) -> str:
+    """
+    Call provider.complete() and return the result string.
+
+    - Skips on billing / quota errors (key is valid; account lacks credits).
+    - Fails on auth errors (key rejected).
+    - Re-raises all other exceptions so real bugs surface.
+    """
+    import anthropic as _ant
+    import openai as _oai
+    try:
+        return provider.complete(messages, model_id)
+    except _ant.AuthenticationError:
+        pytest.fail(f"{provider_name}: API key rejected — check ANTHROPIC_API_KEY in .env")
+    except _oai.AuthenticationError:
+        pytest.fail(f"{provider_name}: API key rejected — check OPENAI_API_KEY in .env")
+    except (_ant.BadRequestError, _ant.PermissionDeniedError) as e:
+        msg = str(e).lower()
+        if any(w in msg for w in ("credit", "billing", "quota", "insufficient")):
+            pytest.skip(f"{provider_name}: key valid, insufficient credits — top up to run complete tests")
+        raise
+    except _oai.RateLimitError as e:
+        if "quota" in str(e).lower() or "billing" in str(e).lower():
+            pytest.skip(f"{provider_name}: key valid, quota exceeded — top up to run complete tests")
+        raise
+
+
 def _image_b64() -> str:
     return base64.b64encode(_IMAGE_PATH.read_bytes()).decode()
 
@@ -192,6 +219,38 @@ class TestAnthropicConnection:
         p = AnthropicProvider(_ANTHROPIC_KEY)
         assert p.count_tokens("hello world this is a test") > 0
 
+    @_SKIP_ANTHROPIC
+    def test_complete_returns_text(self):
+        from src.providers.anthropic_provider import AnthropicProvider
+        p = AnthropicProvider(_ANTHROPIC_KEY)
+        messages = [{"role": "user", "content": "Reply with exactly one word: yes"}]
+        result = _complete_or_skip("Anthropic", p, messages, _ANTHROPIC_MODEL)
+        assert isinstance(result, str)
+        assert len(result.strip()) > 0
+
+    @_SKIP_ANTHROPIC
+    def test_complete_separates_system_message(self):
+        from src.providers.anthropic_provider import AnthropicProvider
+        p = AnthropicProvider(_ANTHROPIC_KEY)
+        messages = [
+            {"role": "system", "content": "You must reply in French only."},
+            {"role": "user", "content": "Say hello."},
+        ]
+        result = _complete_or_skip("Anthropic", p, messages, _ANTHROPIC_MODEL)
+        french_words = {"bonjour", "salut", "allô", "bonsoir", "coucou", "oui", "ça"}
+        assert any(w in result.lower() for w in french_words), (
+            f"Expected French response, got: {result!r}"
+        )
+
+    @_SKIP_ANTHROPIC
+    def test_complete_uses_non_streaming_api(self):
+        """complete() must return a plain string, not a generator or partial object."""
+        from src.providers.anthropic_provider import AnthropicProvider
+        p = AnthropicProvider(_ANTHROPIC_KEY)
+        messages = [{"role": "user", "content": "Say 'ok'"}]
+        result = _complete_or_skip("Anthropic", p, messages, _ANTHROPIC_MODEL)
+        assert isinstance(result, str)
+
 
 # ── OpenAI ─────────────────────────────────────────────────────────────
 
@@ -286,6 +345,24 @@ class TestOpenAIConnection:
         from src.providers.openai_provider import OpenAIProvider
         p = OpenAIProvider(_OPENAI_KEY)
         assert p.count_tokens("hello world this is a test") > 0
+
+    @_SKIP_OPENAI
+    def test_complete_returns_text(self):
+        from src.providers.openai_provider import OpenAIProvider
+        p = OpenAIProvider(_OPENAI_KEY)
+        messages = [{"role": "user", "content": "Reply with exactly one word: yes"}]
+        result = _complete_or_skip("OpenAI", p, messages, _OPENAI_MODEL)
+        assert isinstance(result, str)
+        assert len(result.strip()) > 0
+
+    @_SKIP_OPENAI
+    def test_complete_uses_non_streaming_api(self):
+        """complete() must return a plain string, not a generator or partial object."""
+        from src.providers.openai_provider import OpenAIProvider
+        p = OpenAIProvider(_OPENAI_KEY)
+        messages = [{"role": "user", "content": "Say 'ok'"}]
+        result = _complete_or_skip("OpenAI", p, messages, _OPENAI_MODEL)
+        assert isinstance(result, str)
 
 
 # ── Registry auto-discovery ────────────────────────────────────────────

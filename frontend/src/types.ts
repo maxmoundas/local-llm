@@ -28,6 +28,25 @@ export interface ModelOption {
   id: string
   name: string
   provider: string
+  is_cheapest?: boolean
+}
+
+export interface AppSettings {
+  cheapest_model_id: string | null
+  system_prompt: string
+  default_system_prompt: string
+  memory_enabled: boolean
+  guardrails_enabled: boolean
+  guardrails_input: boolean
+  guardrails_output: boolean
+  guardrails_prompt: string
+  guardrails_topics: string[]
+  default_guardrail_prompt: string
+  models: ModelOption[]
+}
+
+export interface MemoryData {
+  content: string
 }
 
 export interface AttachedImage {

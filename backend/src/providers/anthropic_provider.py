@@ -8,7 +8,7 @@ import anthropic
 from src.providers.base import BaseProvider, ModelOption
 
 _MODELS = [
-    ModelOption(id="claude-haiku-4-5-20251001", name="Claude Haiku 4.5", provider="anthropic"),
+    ModelOption(id="claude-haiku-4-5-20251001", name="Claude Haiku 4.5", provider="anthropic", is_cheapest=True),
     ModelOption(id="claude-sonnet-4-6", name="Claude Sonnet 4.6", provider="anthropic"),
     # ModelOption(id="claude-opus-4-7", name="Claude Opus 4.7", provider="anthropic"),  # expensive — uncomment to re-enable
 ]
@@ -65,3 +65,17 @@ class AnthropicProvider(BaseProvider):
         with self._client.messages.stream(**kwargs) as s:
             for text in s.text_stream:
                 yield text
+
+    def complete(self, messages: list[dict], model_id: str) -> str:
+        system: str | None = None
+        filtered: list[dict] = []
+        for m in messages:
+            if m["role"] == "system":
+                system = m["content"]
+            else:
+                filtered.append({"role": m["role"], "content": m["content"]})
+        kwargs: dict = dict(model=model_id, max_tokens=256, messages=filtered)
+        if system:
+            kwargs["system"] = system
+        response = self._client.messages.create(**kwargs)
+        return response.content[0].text

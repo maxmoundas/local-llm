@@ -85,7 +85,7 @@ export default function ChatView({ chatId, models, selectedModelId, onModelChang
             if (!line.startsWith('data: ')) continue
             const raw = line.slice(6).trim()
             if (!raw) continue
-            let evt: { type: string; content?: string; name?: string; message?: string }
+            let evt: { type: string; content?: string; name?: string; message?: string; target?: string; reason?: string }
             try {
               evt = JSON.parse(raw)
             } catch { continue /* malformed SSE line — skip */ }
@@ -96,6 +96,14 @@ export default function ChatView({ chatId, models, selectedModelId, onModelChang
               finalName = evt.name ?? ''
             } else if (evt.type === 'error') {
               throw new Error(evt.message ?? 'Unknown error from server')
+            } else if (evt.type === 'blocked') {
+              const label = evt.target === 'input' ? 'Input' : 'Response'
+              const suffix = evt.reason ? `: ${evt.reason}` : ''
+              setMessages(prev => [
+                ...prev.filter(m => m.id !== 'streaming'),
+                { id: `blocked-${Date.now()}`, role: 'assistant', content: `🚫 ${label} blocked by safety guardrails${suffix}` },
+              ])
+              return  // finally block handles isGenerating + cleanup
             }
           }
         }

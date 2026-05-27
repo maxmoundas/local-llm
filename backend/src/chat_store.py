@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,19 +35,6 @@ def _preview(messages: list[dict]) -> str:
             text = m["content"][:80]
             return text + ("…" if len(m["content"]) > 80 else "")
     return ""
-
-
-def _auto_name(first_user_msg: str) -> str:
-    text = first_user_msg.strip()
-    # Use the first sentence if it fits cleanly
-    m = re.search(r'[.?!](?:\s|$)', text)
-    if m and m.end() <= 60:
-        return text[:m.end()].strip()
-    # Otherwise truncate at a word boundary
-    if len(text) > 45:
-        truncated = text[:46].rsplit(' ', 1)[0].rstrip(',.;:')
-        return truncated + '…'
-    return text
 
 
 # ------------------------------------------------------------------
@@ -108,11 +94,8 @@ def append_messages(chat_id: str, role: str, content: str, model_id: str | None 
         return None
     chat["messages"].append({"role": role, "content": content})
     chat["updated_at"] = _now()
-    if role == "user":
-        if model_id:
-            chat["model_id"] = model_id
-        if chat["name"] == "New Chat":
-            chat["name"] = _auto_name(content)
+    if role == "user" and model_id:
+        chat["model_id"] = model_id
     _write(chat)
     return chat
 
