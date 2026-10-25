@@ -33,17 +33,18 @@ export const api = {
     fetch(`/api/chats/${id}/pin`, { method: 'POST' }).then(r => r.json()),
 
   /** Returns the raw Response so the caller can read the SSE body stream. */
-  sendMessage: (id: string, content: string, imageBase64?: string, modelId?: string): Promise<Response> =>
+  sendMessage: (id: string, content: string, imageBase64?: string, modelId?: string, signal?: AbortSignal): Promise<Response> =>
     fetch(`/api/chats/${id}/message`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content, image_base64: imageBase64 ?? null, model_id: modelId ?? null }),
+      signal,
     }),
 
   getSettings: (): Promise<AppSettings> =>
     fetch('/api/settings').then(r => r.json()),
 
-  updateSettings: (data: Partial<Omit<AppSettings, 'models'>>): Promise<AppSettings> =>
+  updateSettings: (data: Partial<Omit<AppSettings, 'models' | 'jev_configured'>>): Promise<AppSettings> =>
     fetch('/api/settings', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },

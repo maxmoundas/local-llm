@@ -1,6 +1,6 @@
 # Local LLM
 
-A self-hosted chat interface for running Google Gemma 4 locally, with support for Anthropic and OpenAI cloud models through a unified provider system. The backend exposes an OpenAI-compatible API so it can drop into any project already using the OpenAI SDK.
+A self-hosted, Claude-style chat app for running Google Gemma 4 locally, with Anthropic and OpenAI cloud models through a unified provider system, multi-step web research, and fast structured decisions from TypeSafe's Jev. The backend exposes an OpenAI-compatible API so it can drop into any project already using the OpenAI SDK.
 
 **Default model**: `google/gemma-4-E4B-it` (8B parameters, ~5 GB at 4-bit quantization, fits on an RTX 4070 SUPER with headroom).
 
@@ -43,31 +43,51 @@ The backend is a FastAPI application (`backend/serve.py`) running on port 8000.
 
 **`src/logger.py`** -- Rotating file logger (10 MB per file, 5 backups) with optional console output, written to `backend/logs/`.
 
+### Research (multi-step answers)
+
+For questions that need current or external information, the assistant researches before answering, showing one-line status updates as it goes ("Checking the weather in Nashville", "Searching news for “…”", "Reviewing what I found").
+
+```
+message ─► router ── no ──► answer directly
+              │ yes
+              ▼
+        ┌─► planner (chat model, tool calling) ─► tools in parallel ─┐
+        │                                                           │
+        └──── not enough ◄── sufficiency check (Jev) ◄──────────────┘
+                                   │ enough / max steps / planner stops
+                                   ▼
+                     answer streamed with research notes + sources
+```
+
+- **`src/agent/router.py`** -- `ResearchRouter.decide()` asks Jev whether the message needs fresh/external information (threshold 0.5; on a 24-prompt labeled set research prompts scored 0.82–0.98 and others 0.02–0.07). Falls back to a yes/no from the utility model. `enough()` asks Jev whether the notes so far fully answer the question (stop at ≥ 0.75).
+- **`src/agent/runner.py`** -- `ResearchAgent.run()` yields `status` / `step` / `done` events. The planner is the user's selected chat model using native tool calling (Anthropic, OpenAI) or a prompted-JSON fallback (local). Up to 4 tool calls run in parallel per step; repeated calls are skipped.
+- **`src/agent/tools.py`** -- free, keyless tools: `web_search` and `news_search` (DuckDuckGo via `ddgs`), `fetch_page` (readable text from a URL; refuses private/loopback hosts), `get_weather` (Open-Meteo). Each tool defines its own present- and past-tense status line.
+
+Messages with images skip research. Research can be turned off, and its step limit changed, in **Settings → Research**.
+
+### Jev (TypeSafe System One)
+
+**`src/decision_service.py`** wraps [Jev](https://docs.typesafe.ai/introduction), a model that answers typed questions (`noul` yes/no probability, `choice`, `score`) about a state in a few hundred milliseconds instead of generating text. It is used for the app's quick decisions:
+
+| Use | Jev question(s) | Fallback when Jev is off/unavailable |
+|---|---|---|
+| Research routing | needs fresh/external info? · notes sufficient? | utility-model yes/no · planner decides when to stop |
+| Safety checks | jailbreak · harmful request · self-harm · denied topics (one noul each) + harm-severity score, thresholded by a strict/permissive policy | utility model with the editable JSON prompt |
+| Memory gating | does this message hold a lasting fact about the user? (skip extraction below 0.4) | always run extraction |
+
+Self-harm signals route to a supportive response (a system note with crisis resources) rather than a block. Call Jev from anywhere in the backend with `decision_service.get().ask(state, questions)`, or over HTTP with `POST /api/decide` (same request shape as TypeSafe's `/v1/systemone`). Every use can be switched off in **Settings → Jev**; set `TYPESAFE_API_KEY` in `backend/.env` to enable it.
+
 ### Frontend
 
-React + TypeScript + Vite. Vite proxies `/api`, `/health`, and `/v1` to the backend, so there are no CORS issues and the frontend uses relative paths throughout.
+React + TypeScript + Vite, styled after the Claude app (warm neutrals, serif responses, light and dark themes that follow the OS or can be forced in **Settings → General**). Vite proxies `/api`, `/health`, and `/v1` to the backend.
 
-On load, the app fetches `GET /api/models` to populate the model selector and polls `GET /health` every 3 seconds until `local_model_loaded` is true. While the local model is loading, a banner is shown and the local model option in the selector is disabled — cloud models are immediately usable. When the user sends a message, the frontend calls `POST /api/chats/{id}/message` and reads the response body as a `ReadableStream`, parsing SSE events line by line. Tokens are appended to the streaming message bubble in real time. A `done` event carries the auto-generated chat title; an `error` event (including API billing errors) surfaces the error message directly in the chat bubble.
-
-Key components:
-
-- `App.tsx` -- top-level state: chat list, current chat, model list, selected model, local model load status. Polls `/health` on startup.
-- `ChatView.tsx` -- message list and SSE stream consumer. Notifies the parent of the stored model when a chat is loaded so the selector stays in sync.
-- `InputBar.tsx` -- text input with image attachment support.
-- `ModelSelector.tsx` -- dropdown to switch between available models (switching creates a new chat). Disables and labels the local model as `(loading...)` while it is not yet ready.
-- `Sidebar.tsx` -- full-featured conversation list (see below).
-- `api/client.ts` -- thin typed wrappers over `fetch`.
-
-### Sidebar
-
-The sidebar provides:
-
-- **Search** — filters by chat name or preview text in real time.
-- **Date grouping** — chats are bucketed into Today / Yesterday / Previous 7 Days / Older based on last activity.
-- **Pin / star** — `☆`/`★` button on hover pins a chat to a permanent "Pinned" section above the date groups. The star stays visible on pinned chats.
-- **Inline rename** — double-click any chat name to edit it in place; Enter commits, Escape cancels.
-- **Delete on hover** — `✕` button appears alongside the pin button on hover.
-- **Model badge** — small colored pill showing the last model used in each chat (Local, Haiku, Sonnet, GPT mini, etc.).
+- `App.tsx` -- layout and top-level state. The new-chat screen creates the chat on first send. Switching models keeps the current chat; the last-used model is remembered.
+- `ChatView.tsx` -- message list and SSE consumer (`lib/sse.ts`); follows the stream while you're at the bottom; **Stop** aborts the request and the partial reply is kept.
+- `Message.tsx` / `Markdown.tsx` -- user bubbles, assistant prose (GFM tables, code blocks with copy).
+- `ResearchSteps.tsx` -- the live status line while researching, collapsing to "Researched · N steps · M sources" with the step list and source chips.
+- `Composer.tsx` / `ModelMenu.tsx` -- input card with image attach/paste/drop, model menu, send/stop.
+- `Sidebar.tsx` -- collapsible; New chat, Search, Starred, Recents, per-chat menu (star, rename, delete).
+- `SettingsView.tsx` -- General, Research, Jev, Safety, Memory, Models.
 
 ### Chat persistence
 
@@ -82,16 +102,16 @@ Each conversation is stored as a JSON file in `backend/chats/`, named by UUID (`
   "model_id": "claude-haiku-4-5-20251001",
   "pinned": false,
   "messages": [
-    { "role": "system",    "content": "..." },
     { "role": "user",      "content": "..." },
-    { "role": "assistant", "content": "..." }
+    { "role": "assistant", "content": "...",
+      "steps":   [{ "tool": "web_search", "label": "Searched the web for “…”", "summary": "6 results" }],
+      "sources": [{ "title": "...", "url": "https://..." }],
+      "stopped": true }
   ]
 }
 ```
 
-`model_id` records the last model used in the chat and drives the sidebar badge and model selector sync when switching chats. `pinned` is set by the pin toggle in the sidebar.
-
-The chat title is auto-generated from the first user message: the first sentence is used if it is 60 characters or fewer; otherwise the text is truncated at a word boundary with `…`. Titles can also be renamed inline in the sidebar (double-click) or in the chat header (click). Chats survive server restarts.
+`steps`, `sources`, and `stopped` are display-only and stripped before history is sent to a model. `model_id` records the last model used. The title is generated by the utility model after the first exchange and can be renamed from the sidebar menu or by clicking the title.
 
 ### Streaming (SSE)
 
@@ -99,11 +119,15 @@ The chat title is auto-generated from the first user message: the first sentence
 
 | Event type | Payload | Description |
 |---|---|---|
+| `status` | `{ "type": "status", "text": "..." }` | One-line research status (research only) |
+| `step` | `{ "type": "step", "step": { "tool", "label", "summary" } }` | A finished tool call (research only) |
+| `sources` | `{ "type": "sources", "sources": [{ "title", "url" }] }` | Sources gathered (research only) |
 | `token` | `{ "type": "token", "content": "..." }` | One token from the model |
+| `blocked` | `{ "type": "blocked", "target": "input" \| "output", "reason": "..." }` | Stopped by a safety check |
 | `done` | `{ "type": "done", "name": "..." }` | Stream complete, carries the chat title |
-| `error` | `{ "type": "error", "message": "..." }` | Generation failed (shown in the chat bubble) |
+| `error` | `{ "type": "error", "message": "..." }` | Generation failed (shown in the chat) |
 
-The response is written to the chat store only after the full stream completes (on `done`). If the stream errors, the partial response is discarded and the error message is displayed to the user.
+The reply is saved when the stream completes. If the client disconnects (Stop), the partial reply is saved with `"stopped": true`. All blocking work — safety checks, routing, tools, generation — runs in a worker thread, never on the event loop.
 
 ### Multi-provider system
 
@@ -147,11 +171,19 @@ local-llm/
 │   ├── src/
 │   │   ├── model.py              # LocalLLM: HF Transformers, 4-bit quant, streaming
 │   │   ├── server.py             # FastAPI routes, SSE streaming, OpenAI endpoint
+│   │   ├── llm_service.py        # every LLM call: routing, logging, tool turns
+│   │   ├── decision_service.py   # Jev client + DecisionService (typed decisions)
+│   │   ├── guardrail_service.py  # safety checks (Jev battery, LLM fallback)
+│   │   ├── agent/
+│   │   │   ├── router.py         # research? / enough? decisions
+│   │   │   ├── runner.py         # ResearchAgent loop (status/step/done events)
+│   │   │   └── tools.py          # web_search, news_search, fetch_page, get_weather
 │   │   ├── chat_store.py         # JSON-file chat persistence
+│   │   ├── memory_store.py / settings_store.py
 │   │   ├── config.py             # config.yaml loader + env overrides
 │   │   ├── logger.py             # Rotating file + console logger
 │   │   └── providers/
-│   │       ├── base.py           # BaseProvider ABC, ModelOption dataclass
+│   │       ├── base.py           # BaseProvider ABC, ModelOption, ToolCall/ToolTurn
 │   │       ├── local.py          # LocalProvider (wraps LocalLLM)
 │   │       ├── anthropic_provider.py
 │   │       ├── openai_provider.py
@@ -168,14 +200,10 @@ local-llm/
 │   ├── src/
 │   │   ├── App.tsx
 │   │   ├── api/client.ts
-│   │   ├── components/
-│   │   │   ├── ChatView.tsx
-│   │   │   ├── Message.tsx
-│   │   │   ├── ModelSelector.tsx
-│   │   │   ├── InputBar.tsx
-│   │   │   ├── Sidebar.tsx
-│   │   │   └── EmptyState.tsx
-│   │   ├── styles/global.css
+│   │   ├── lib/                  # sse.ts (event parser), theme.ts (light/dark)
+│   │   ├── components/           # ChatView, Message, Markdown, ResearchSteps, Composer,
+│   │   │                         # ModelMenu, NewChat, Sidebar, SettingsView, Icons
+│   │   ├── styles/global.css     # design tokens (light + dark) and all styles
 │   │   └── types.ts
 │   ├── package.json
 │   └── vite.config.ts            # Proxies /api, /health, /v1 to :8000
@@ -213,6 +241,9 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 # Optional: enables OpenAI models in the UI
 OPENAI_API_KEY=sk-...
+
+# Optional: enables Jev for routing, safety checks, and memory gating
+TYPESAFE_API_KEY=apikey_...
 ```
 
 You need a HuggingFace account with access granted to `google/gemma-4-E4B-it` at huggingface.co/google/gemma-4-E4B-it.
@@ -291,6 +322,9 @@ Environment variable overrides: `MODEL_REPO_ID`, `MODEL_QUANTIZATION`, `SERVER_P
 | `PATCH` | `/api/chats/{id}` | Rename a chat |
 | `DELETE` | `/api/chats/{id}` | Delete a chat |
 | `POST` | `/api/chats/{id}/pin` | Toggle pin state; returns `{ "pinned": bool }` |
+| `GET` / `PATCH` | `/api/settings` | Read / update settings (research, Jev, safety, memory, …) |
+| `GET` / `PATCH` | `/api/memory` | Read / replace the memory profile |
+| `POST` | `/api/decide` | Ask Jev typed questions: `{ "state": ..., "questions": {...} }` |
 
 **`GET /health` response:**
 ```json

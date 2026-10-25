@@ -254,7 +254,7 @@ class TestAnthropicProvider:
         with patch("anthropic.Anthropic") as mock_cls:
             from src.providers.anthropic_provider import AnthropicProvider
             mock_msg = MagicMock()
-            mock_msg.content = [MagicMock(text="Short answer")]
+            mock_msg.content = [MagicMock(type="text", text="Short answer")]
             mock_cls.return_value.messages.create.return_value = mock_msg
             p = AnthropicProvider("test-key")
             result = p.complete([{"role": "user", "content": "hi"}], "claude-haiku-4-5-20251001")
@@ -605,3 +605,44 @@ class TestSendMessageWithModelId:
             json={"content": "hi", "model_id": None},
         )
         assert resp.status_code == 200
+
+
+class TestCheapestModelReadiness:
+    def _provider(self, name: str, model_id: str, ready: bool) -> BaseProvider:
+        class P(BaseProvider):
+            provider_name = name
+            models = [ModelOption(id=model_id, name=model_id, provider=name, is_cheapest=True)]
+            def stream(self, *a, **k): return iter([])
+            def complete(self, messages, model_id): return ""
+        P.ready = property(lambda self: ready)
+        return P()
+
+    def test_skips_provider_that_is_not_ready(self):
+        registry = ProviderRegistry()
+        registry.register(self._provider("local", "gemma", ready=False))
+        registry.register(self._provider("anthropic", "haiku", ready=True))
+        assert registry.cheapest_model.id == "haiku"
+
+    def test_prefers_first_ready_provider(self):
+        registry = ProviderRegistry()
+        registry.register(self._provider("local", "gemma", ready=True))
+        registry.register(self._provider("anthropic", "haiku", ready=True))
+        assert registry.cheapest_model.id == "gemma"
+
+    def test_falls_back_to_first_flagged_when_none_ready(self):
+        registry = ProviderRegistry()
+        registry.register(self._provider("local", "gemma", ready=False))
+        assert registry.cheapest_model.id == "gemma"
+
+    def test_local_provider_ready_tracks_model_load(self, mock_llm):
+        from src.providers.local import LocalProvider
+        assert LocalProvider(mock_llm).ready is True
+        mock_llm.model = None
+        assert LocalProvider(mock_llm).ready is False
+
+    def test_llm_service_ignores_override_that_is_not_ready(self):
+        from src.llm_service import LLMService
+        registry = ProviderRegistry()
+        registry.register(self._provider("local", "gemma", ready=False))
+        registry.register(self._provider("anthropic", "haiku", ready=True))
+        assert LLMService(registry, cheapest_model_id="gemma")._resolve_cheapest_id() == "haiku"

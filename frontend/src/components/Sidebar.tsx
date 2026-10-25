@@ -1,207 +1,189 @@
-import { useState, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { Chat } from '../types'
+import {
+  CloseIcon, DotsIcon, PanelIcon, PencilIcon, PlusIcon, SearchIcon, SettingsIcon, StarIcon, TrashIcon,
+} from './Icons'
 
 interface Props {
+  open: boolean
+  onToggle: () => void
   chats: Chat[]
   currentChatId: string | null
   onSelect: (id: string) => void
-  onCreate: () => void
+  onNewChat: () => void
   onDelete: (id: string) => void
   onRename: (id: string, name: string) => void
   onPin: (id: string) => void
   onSettings: () => void
   settingsActive: boolean
+  displayName: string
 }
 
-function modelLabel(modelId: string | undefined): string | null {
-  if (!modelId) return null
-  if (modelId.startsWith('google/') || modelId.includes('gemma')) return 'Local'
-  if (modelId.includes('haiku'))  return 'Haiku'
-  if (modelId.includes('sonnet')) return 'Sonnet'
-  if (modelId.includes('opus'))   return 'Opus'
-  if (modelId.includes('mini'))   return 'GPT mini'
-  if (modelId.startsWith('gpt-')) return 'GPT'
-  return null
-}
+function ChatRow({ chat, active, onSelect, onDelete, onRename, onPin }: {
+  chat: Chat
+  active: boolean
+  onSelect: () => void
+  onDelete: () => void
+  onRename: (name: string) => void
+  onPin: () => void
+}) {
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [editing, setEditing] = useState(false)
+  const [name, setName] = useState(chat.name)
+  const menuRef = useRef<HTMLDivElement>(null)
 
-function modelProvider(modelId: string | undefined): string {
-  if (!modelId) return ''
-  if (modelId.startsWith('google/') || modelId.includes('gemma')) return 'local'
-  if (modelId.includes('claude')) return 'anthropic'
-  if (modelId.startsWith('gpt-')) return 'openai'
-  return ''
-}
+  useEffect(() => {
+    if (!menuOpen) return
+    const onDown = (e: MouseEvent) => { if (!menuRef.current?.contains(e.target as Node)) setMenuOpen(false) }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [menuOpen])
 
-function groupByDate(chats: Chat[]): { label: string; chats: Chat[] }[] {
-  const now = new Date()
-  const today     = new Date(now.getFullYear(), now.getMonth(), now.getDate())
-  const yesterday = new Date(today.getTime() - 86_400_000)
-  const week      = new Date(today.getTime() - 7 * 86_400_000)
-
-  const buckets: { label: string; test: (d: Date) => boolean }[] = [
-    { label: 'Today',            test: d => d >= today },
-    { label: 'Yesterday',        test: d => d >= yesterday && d < today },
-    { label: 'Previous 7 Days',  test: d => d >= week && d < yesterday },
-    { label: 'Older',            test: d => d < week },
-  ]
-
-  return buckets
-    .map(b => ({ label: b.label, chats: chats.filter(c => b.test(new Date(c.updated_at))) }))
-    .filter(g => g.chats.length > 0)
-}
-
-export default function Sidebar({ chats, currentChatId, onSelect, onCreate, onDelete, onRename, onPin, onSettings, settingsActive }: Props) {
-  const [search, setSearch]     = useState('')
-  const [editingId, setEditingId] = useState<string | null>(null)
-  const [editName, setEditName]   = useState('')
-  const editRef = useRef<HTMLInputElement>(null)
-
-  const query    = search.trim().toLowerCase()
-  const filtered = query
-    ? chats.filter(c =>
-        c.name.toLowerCase().includes(query) ||
-        c.preview.toLowerCase().includes(query)
-      )
-    : chats
-
-  const pinned   = filtered.filter(c => c.pinned)
-  const unpinned = filtered.filter(c => !c.pinned)
-  const groups   = groupByDate(unpinned)
-
-  const startEdit = (e: React.MouseEvent, chat: Chat) => {
-    e.stopPropagation()
-    setEditingId(chat.id)
-    setEditName(chat.name)
-    setTimeout(() => { editRef.current?.select() }, 0)
+  const commit = () => {
+    const trimmed = name.trim()
+    if (trimmed && trimmed !== chat.name) onRename(trimmed)
+    else setName(chat.name)
+    setEditing(false)
   }
 
-  const commitEdit = (id: string) => {
-    const trimmed = editName.trim()
-    const original = chats.find(c => c.id === id)?.name ?? ''
-    if (trimmed && trimmed !== original) onRename(id, trimmed)
-    setEditingId(null)
-  }
-
-  const handleDelete = (e: React.MouseEvent, id: string, name: string) => {
-    e.stopPropagation()
-    if (confirm(`Delete "${name}"?`)) onDelete(id)
-  }
-
-  const renderChat = (chat: Chat) => {
-    const label    = modelLabel(chat.model_id)
-    const provider = modelProvider(chat.model_id)
-    const isActive  = chat.id === currentChatId
-    const isEditing = editingId === chat.id
-
+  if (editing) {
     return (
-      <div
-        key={chat.id}
-        className={`chat-item${isActive ? ' active' : ''}`}
-        onClick={() => { if (!isEditing) onSelect(chat.id) }}
-      >
-        <div className="chat-item-text">
-          {isEditing ? (
-            <input
-              ref={editRef}
-              className="chat-item-name-input"
-              value={editName}
-              autoFocus
-              onChange={e => setEditName(e.target.value)}
-              onBlur={() => commitEdit(chat.id)}
-              onKeyDown={e => {
-                if (e.key === 'Enter')  e.currentTarget.blur()
-                if (e.key === 'Escape') setEditingId(null)
-                e.stopPropagation()
-              }}
-              onClick={e => e.stopPropagation()}
-            />
-          ) : (
-            <div className="chat-item-name" onDoubleClick={e => startEdit(e, chat)}>
-              {chat.name}
-            </div>
-          )}
-          <div className="chat-item-meta">
-            {chat.preview && <span className="chat-item-preview">{chat.preview}</span>}
-            {label && (
-              <span className={`chat-model-badge provider-${provider}`}>{label}</span>
-            )}
-          </div>
-        </div>
-
-        <div className="chat-item-actions">
-          <button
-            className={`chat-pin-btn${chat.pinned ? ' pinned' : ''}`}
-            onClick={e => { e.stopPropagation(); onPin(chat.id) }}
-            title={chat.pinned ? 'Unpin' : 'Pin'}
-          >
-            {chat.pinned ? '★' : '☆'}
-          </button>
-          <button
-            className="chat-delete-btn"
-            onClick={e => handleDelete(e, chat.id, chat.name)}
-            title="Delete chat"
-          >
-            ✕
-          </button>
-        </div>
+      <div className="chat-row editing">
+        <input
+          className="chat-row-input"
+          value={name}
+          autoFocus
+          onFocus={e => e.currentTarget.select()}
+          onChange={e => setName(e.target.value)}
+          onBlur={commit}
+          onKeyDown={e => {
+            if (e.key === 'Enter') e.currentTarget.blur()
+            if (e.key === 'Escape') { setName(chat.name); setEditing(false) }
+          }}
+        />
       </div>
     )
   }
 
-  const renderGroup = (label: string, items: Chat[]) => (
-    <div key={label} className="chat-group">
-      <div className="chat-group-label">{label}</div>
-      {items.map(renderChat)}
-    </div>
-  )
-
-  const empty = pinned.length === 0 && unpinned.length === 0
-
   return (
-    <aside className="sidebar">
-      <div className="sidebar-header">
-        <div className="brand">
-          <div className="brand-dot" />
-          Local LLM
-        </div>
-        <button className="new-chat-btn" onClick={onCreate} title="New chat">+</button>
-      </div>
-
-      <div className="sidebar-search">
-        <input
-          className="search-input"
-          placeholder="Search chats…"
-          value={search}
-          onChange={e => setSearch(e.target.value)}
-        />
-        {search && (
-          <button className="search-clear" onClick={() => setSearch('')}>✕</button>
-        )}
-      </div>
-
-      <div className="chat-list">
-        {empty && (
-          <div className="sidebar-no-results">
-            {query ? 'No chats match your search' : 'No conversations yet'}
+    <div className={`chat-row${active ? ' active' : ''}${menuOpen ? ' menu-open' : ''}`} onClick={onSelect}>
+      <span className="chat-row-name" onDoubleClick={() => setEditing(true)}>{chat.name}</span>
+      <div className="chat-row-menu" ref={menuRef} onClick={e => e.stopPropagation()}>
+        <button className="icon-btn small" onClick={() => setMenuOpen(o => !o)} aria-label="Chat options">
+          <DotsIcon size={16} />
+        </button>
+        {menuOpen && (
+          <div className="popover row-menu">
+            <button onClick={() => { setMenuOpen(false); onPin() }}>
+              <StarIcon size={15} filled={chat.pinned} /> {chat.pinned ? 'Unstar' : 'Star'}
+            </button>
+            <button onClick={() => { setMenuOpen(false); setEditing(true) }}>
+              <PencilIcon size={15} /> Rename
+            </button>
+            <button className="danger" onClick={() => {
+              setMenuOpen(false)
+              if (confirm(`Delete "${chat.name}"?`)) onDelete()
+            }}>
+              <TrashIcon size={15} /> Delete
+            </button>
           </div>
         )}
-        {pinned.length > 0 && renderGroup('Pinned', pinned)}
-        {groups.map(g => renderGroup(g.label, g.chats))}
       </div>
+    </div>
+  )
+}
 
-      <div className="sidebar-footer">
-        <button
-          className={`sidebar-settings-btn${settingsActive ? ' active' : ''}`}
-          onClick={onSettings}
-          title="Settings"
-        >
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <circle cx="12" cy="12" r="3"/>
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-          </svg>
-          Settings
+export default function Sidebar({
+  open, onToggle, chats, currentChatId, onSelect, onNewChat, onDelete, onRename, onPin,
+  onSettings, settingsActive, displayName,
+}: Props) {
+  const [search, setSearch] = useState('')
+  const [searching, setSearching] = useState(false)
+  const query = search.trim().toLowerCase()
+  const filtered = query
+    ? chats.filter(c => c.name.toLowerCase().includes(query) || c.preview.toLowerCase().includes(query))
+    : chats
+  const starred = filtered.filter(c => c.pinned)
+  const recents = filtered.filter(c => !c.pinned)
+  const initial = (displayName.trim()[0] ?? 'Y').toUpperCase()
+
+  const row = (c: Chat) => (
+    <ChatRow
+      key={c.id}
+      chat={c}
+      active={c.id === currentChatId && !settingsActive}
+      onSelect={() => onSelect(c.id)}
+      onDelete={() => onDelete(c.id)}
+      onRename={name => onRename(c.id, name)}
+      onPin={() => onPin(c.id)}
+    />
+  )
+
+  if (!open) {
+    return (
+      <aside className="sidebar collapsed">
+        <button className="icon-btn" onClick={onToggle} title="Open sidebar" aria-label="Open sidebar"><PanelIcon /></button>
+        <button className="new-chat-mini" onClick={onNewChat} title="New chat" aria-label="New chat"><PlusIcon size={16} /></button>
+        <button className="icon-btn" onClick={() => { onToggle(); setSearching(true) }} title="Search" aria-label="Search chats">
+          <SearchIcon />
         </button>
-      </div>
-    </aside>
+        <div className="sidebar-spacer" />
+        <button className="avatar" onClick={onSettings} title="Settings" aria-label="Settings">{initial}</button>
+      </aside>
+    )
+  }
+
+  return (
+    <>
+      <div className="sidebar-scrim" onClick={onToggle} />
+      <aside className="sidebar">
+        <div className="sidebar-top">
+          <span className="brand">Local LLM</span>
+          <button className="icon-btn" onClick={onToggle} title="Close sidebar" aria-label="Close sidebar"><PanelIcon /></button>
+        </div>
+
+        <nav className="sidebar-nav">
+          <button className="nav-item new-chat" onClick={onNewChat}>
+            <span className="new-chat-icon"><PlusIcon size={14} /></span> New chat
+          </button>
+          {searching ? (
+            <div className="sidebar-search">
+              <SearchIcon size={16} />
+              <input autoFocus placeholder="Search chats" value={search} onChange={e => setSearch(e.target.value)}
+                     onKeyDown={e => { if (e.key === 'Escape') { setSearch(''); setSearching(false) } }} />
+              <button className="icon-btn small" onClick={() => { setSearch(''); setSearching(false) }} aria-label="Close search">
+                <CloseIcon size={14} />
+              </button>
+            </div>
+          ) : (
+            <button className="nav-item" onClick={() => setSearching(true)}><SearchIcon size={16} /> Search</button>
+          )}
+        </nav>
+
+        <div className="chat-list">
+          {starred.length > 0 && (
+            <section>
+              <h3 className="chat-list-label">Starred</h3>
+              {starred.map(row)}
+            </section>
+          )}
+          <section>
+            <h3 className="chat-list-label">Recents</h3>
+            {recents.map(row)}
+            {filtered.length === 0 && (
+              <div className="chat-list-empty">{query ? 'No chats match your search' : 'No conversations yet'}</div>
+            )}
+          </section>
+        </div>
+
+        <div className="sidebar-footer">
+          <button className={`account${settingsActive ? ' active' : ''}`} onClick={onSettings}>
+            <span className="avatar">{initial}</span>
+            <span className="account-name">{displayName.trim() || 'You'}</span>
+            <SettingsIcon size={16} className="account-gear" />
+          </button>
+        </div>
+      </aside>
+    </>
   )
 }

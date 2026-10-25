@@ -11,12 +11,16 @@ Endpoints
   PATCH /api/chats/{id}
   DELETE /api/chats/{id}
   POST /api/chats/{id}/message   ← SSE streaming response
+  GET/PATCH /api/settings
+  GET/PATCH /api/memory
+  POST /api/decide               ← Jev passthrough (structured decisions)
   GET  /v1/models                ← OpenAI-compat
   POST /v1/chat/completions      ← OpenAI-compat
 """
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
@@ -24,14 +28,19 @@ from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 import uvicorn
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.concurrency import iterate_in_threadpool, run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 
-from src import chat_store, memory_store, settings_store
+from src import chat_store, decision_service, memory_store, settings_store
+from src.agent.router import ResearchRouter
+from src.agent.runner import ResearchAgent, build_answer_system
+from src.agent.tools import default_tools
 from src.config import load_config
-from src.guardrail_service import GuardrailService
+from src.decision_service import CALL_TYPE_MEMORY, DecisionError, DecisionService, noul
+from src.guardrail_service import SUPPORT_SYSTEM_NOTE, GuardrailService
 from src.llm_service import CALL_TYPE_CHAT, LLMService
 from src.logger import get_logger, setup_logging
 from src.model import LocalLLM
@@ -42,17 +51,66 @@ logger = get_logger(__name__)
 _llm: LocalLLM | None = None
 _registry: ProviderRegistry | None = None
 _llm_service: LLMService | None = None
+_decision_svc: DecisionService | None = None
 _system_prompt: str = DEFAULT_SYSTEM_PROMPT
 _memory_enabled: bool = True
+_jev_memory: bool = True
 _guardrail_svc: GuardrailService | None = None
 _guardrails_input: bool = True
 _guardrails_output: bool = False
+# Research loop — None when disabled in settings (or before startup), so messages answer directly.
+_router: ResearchRouter | None = None
+_agent: ResearchAgent | None = None
+
+_MEMORY_THRESHOLD = 0.4
+_HAS_DURABLE_FACT = noul(
+    "The message reveals a lasting personal fact about the sender (their name, job, location, tools or languages "
+    "they use, ongoing projects, stated preferences, or recurring constraints) worth remembering for future "
+    "conversations.",
+    true="It states something durable about who the sender is, what they work on, or how they like things done.",
+    false="It is only a question, task, or one-off detail with nothing lasting about the sender.",
+)
+
+
+def _apply_settings(s: dict) -> None:
+    """(Re)build every settings-driven service. Called at startup and after each PATCH."""
+    global _system_prompt, _memory_enabled, _jev_memory
+    global _guardrail_svc, _guardrails_input, _guardrails_output, _router, _agent
+
+    if _llm_service is not None:
+        _llm_service.set_cheapest_model(s.get("cheapest_model_id"))
+    _system_prompt = s.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
+    _memory_enabled = bool(s.get("memory_enabled", True))
+    _jev_memory = bool(s.get("jev_memory", True))
+
+    if _decision_svc is not None:
+        _decision_svc.enabled = bool(s.get("jev_enabled", True))
+        _decision_svc.model = s.get("jev_model") or decision_service.DEFAULT_MODEL
+
+    _guardrails_input = bool(s.get("guardrails_input", True))
+    _guardrails_output = bool(s.get("guardrails_output", False))
+    if s.get("guardrails_enabled", False) and _llm_service is not None:
+        _guardrail_svc = GuardrailService(
+            _llm_service,
+            prompt=s.get("guardrails_prompt") or DEFAULT_GUARDRAIL_PROMPT,
+            denied_topics=s.get("guardrails_topics") or [],
+            decisions=_decision_svc if s.get("jev_guardrails", True) else None,
+            policy=s.get("guardrails_policy") or "strict",
+        )
+    else:
+        _guardrail_svc = None
+
+    if s.get("agent_enabled", True) and _llm_service is not None:
+        _router = ResearchRouter(_llm_service, _decision_svc, use_jev=bool(s.get("jev_routing", True)))
+        _agent = ResearchAgent(_llm_service, _router, default_tools(),
+                               max_steps=int(s.get("agent_max_steps") or 4))
+    else:
+        _router = _agent = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _llm, _registry, _llm_service, _system_prompt, _memory_enabled
-    global _guardrail_svc, _guardrails_input, _guardrails_output
+    global _llm, _registry, _llm_service, _decision_svc
     cfg = load_config()
     setup_logging(cfg)
     logger.info("Starting backend")
@@ -60,18 +118,14 @@ async def lifespan(app: FastAPI):
     _registry = build_registry(_llm)
     saved_settings = settings_store.load()
     _llm_service = LLMService(_registry, cheapest_model_id=saved_settings.get("cheapest_model_id"))
-    _system_prompt = saved_settings.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
-    _memory_enabled = bool(saved_settings.get("memory_enabled", True))
-    _guardrails_input = bool(saved_settings.get("guardrails_input", True))
-    _guardrails_output = bool(saved_settings.get("guardrails_output", False))
-    if saved_settings.get("guardrails_enabled", False):
-        _guardrail_svc = GuardrailService(
-            _llm_service,
-            prompt=saved_settings.get("guardrails_prompt") or DEFAULT_GUARDRAIL_PROMPT,
-            denied_topics=saved_settings.get("guardrails_topics") or [],
-        )
+    _decision_svc = DecisionService(os.getenv("TYPESAFE_API_KEY"))
+    decision_service.configure(_decision_svc)
+    _apply_settings(saved_settings)
     cheapest = _registry.cheapest_model
-    logger.info("Server ready — cheapest model: %s (%s)", cheapest.name, cheapest.id)
+    logger.info("Server ready — cheapest model: %s (%s) | jev=%s | research=%s",
+                cheapest.name, cheapest.id,
+                "on" if _decision_svc.available else ("off" if _decision_svc.configured else "no key"),
+                "on" if _agent else "off")
     threading.Thread(target=_llm.load, daemon=True, name="model-loader").start()
     yield
 
@@ -107,24 +161,53 @@ def _require_service() -> LLMService:
 
 
 def _build_messages(chat: dict) -> list[dict]:
-    msgs = chat.get("messages", [])
+    """Provider-ready history: system prompt first, display-only fields stripped.
+
+    Empty turns (e.g. a reply stopped before any text) are dropped and consecutive
+    same-role turns merged, since some providers require strict user/assistant alternation.
+    """
     system = _system_prompt
     if _memory_enabled:
         mem = memory_store.load()
         if mem:
             system = f"{system}\n\n[User Memory]\n{mem}"
-    if not msgs or msgs[0]["role"] != "system":
-        return [{"role": "system", "content": system}] + msgs
-    return msgs
+    out: list[dict] = [{"role": "system", "content": system}]
+    for m in chat.get("messages", []):
+        if m["role"] == "system" or not m.get("content"):
+            continue
+        if out[-1]["role"] == m["role"]:
+            out[-1] = {"role": m["role"], "content": f"{out[-1]['content']}\n\n{m['content']}"}
+        else:
+            out.append({"role": m["role"], "content": m["content"]})
+    return out
 
 
 def _maybe_update_memory(user_message: str, svc: LLMService) -> None:
-    """Background task: extract durable facts from the user message and update memory if changed."""
+    """Background task: extract durable facts from the user message and update memory if changed.
+
+    When Jev is on for memory, it first checks whether the message holds anything worth
+    remembering, which skips the LLM call for the large majority of messages.
+    """
+    if _jev_memory and _decision_svc is not None and _decision_svc.available:
+        try:
+            p = _decision_svc.ask({"message": user_message[:2000]}, {"durable": _HAS_DURABLE_FACT},
+                                  call_type=CALL_TYPE_MEMORY)["durable"].noul
+            if p < _MEMORY_THRESHOLD:
+                return
+        except DecisionError:
+            pass  # no gate — let the LLM decide
     current = memory_store.load()
     updated = svc.extract_memory(user_message, current)
     if updated is not None:
         memory_store.save(updated)
         logger.info("Memory updated")
+
+
+def _model_dicts(registry: ProviderRegistry) -> list[dict]:
+    return [
+        {"id": m.id, "name": m.name, "provider": m.provider, "is_cheapest": m.is_cheapest}
+        for m in registry.list_models()
+    ]
 
 
 # ── Health & model discovery ───────────────────────────────────────────
@@ -136,16 +219,13 @@ async def health() -> dict[str, Any]:
         "status": "ok" if loaded else "loading",
         "model": _llm.repo_id if _llm else None,
         "local_model_loaded": loaded,
+        "jev_available": bool(_decision_svc and _decision_svc.available),
     }
 
 
 @app.get("/api/models")
 async def api_list_models() -> list[dict]:
-    registry = _require_registry()
-    return [
-        {"id": m.id, "name": m.name, "provider": m.provider, "is_cheapest": m.is_cheapest}
-        for m in registry.list_models()
-    ]
+    return _model_dicts(_require_registry())
 
 
 # ── Chat management (/api/chats/*) ─────────────────────────────────────
@@ -211,6 +291,15 @@ class SettingsUpdate(BaseModel):
     guardrails_output: bool | None = None
     guardrails_prompt: str | None = None
     guardrails_topics: list[str] | None = None
+    guardrails_policy: Literal["strict", "permissive"] | None = None
+    agent_enabled: bool | None = None
+    agent_max_steps: int | None = Field(default=None, ge=1, le=8)
+    jev_enabled: bool | None = None
+    jev_model: str | None = None
+    jev_routing: bool | None = None
+    jev_guardrails: bool | None = None
+    jev_memory: bool | None = None
+    display_name: str | None = None
 
 
 @app.get("/api/settings")
@@ -221,34 +310,18 @@ async def api_get_settings() -> dict:
         **current,
         "default_system_prompt": DEFAULT_SYSTEM_PROMPT,
         "default_guardrail_prompt": DEFAULT_GUARDRAIL_PROMPT,
-        "models": [
-            {"id": m.id, "name": m.name, "provider": m.provider, "is_cheapest": m.is_cheapest}
-            for m in registry.list_models()
-        ],
+        "jev_configured": bool(_decision_svc and _decision_svc.configured),
+        "models": _model_dicts(registry),
     }
 
 
 @app.patch("/api/settings")
 async def api_update_settings(req: SettingsUpdate) -> dict:
-    global _system_prompt, _memory_enabled, _guardrail_svc, _guardrails_input, _guardrails_output
     # Only save fields that were explicitly provided in the request body.
     updates = {k: v for k, v in req.model_dump().items() if k in req.model_fields_set}
     updated = settings_store.save(updates)
-    if _llm_service is not None:
-        _llm_service.set_cheapest_model(updated.get("cheapest_model_id"))
-    _system_prompt = updated.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
-    _memory_enabled = bool(updated.get("memory_enabled", True))
-    _guardrails_input = bool(updated.get("guardrails_input", True))
-    _guardrails_output = bool(updated.get("guardrails_output", False))
-    if updated.get("guardrails_enabled", False) and _llm_service is not None:
-        _guardrail_svc = GuardrailService(
-            _llm_service,
-            prompt=updated.get("guardrails_prompt") or DEFAULT_GUARDRAIL_PROMPT,
-            denied_topics=updated.get("guardrails_topics") or [],
-        )
-    else:
-        _guardrail_svc = None
-    logger.info("Settings updated: %s", updated)
+    _apply_settings(updated)
+    logger.info("Settings updated: %s", sorted(updates))
     return updated
 
 
@@ -269,6 +342,27 @@ async def api_update_memory(req: MemoryUpdate) -> dict:
     return {"content": req.content.strip()}
 
 
+# ── Decisions (/api/decide) ─────────────────────────────────────────────
+
+class DecideRequest(BaseModel):
+    state: Any
+    questions: dict[str, dict]
+
+
+@app.post("/api/decide")
+async def api_decide(req: DecideRequest) -> dict:
+    """Ask Jev typed questions about a state. Same request shape as TypeSafe's /v1/systemone."""
+    if _decision_svc is None or not _decision_svc.available:
+        raise HTTPException(503, "Jev is not configured or is disabled in settings")
+    try:
+        answers = await run_in_threadpool(_decision_svc.ask, req.state, req.questions)
+    except DecisionError as exc:
+        raise HTTPException(502, f"Jev request failed: {exc}")
+    return {"answers": {k: vars(a) for k, a in answers.items()}}
+
+
+# ── Sending a message (SSE) ────────────────────────────────────────────
+
 _SSE_HEADERS = {
     "Cache-Control": "no-cache, no-transform",
     "X-Accel-Buffering": "no",
@@ -276,22 +370,22 @@ _SSE_HEADERS = {
 }
 
 
-def _sse_blocked(target: str, reason: str | None):
-    """Minimal SSE stream that emits a single 'blocked' event."""
+def _sse(data: dict) -> str:
+    return f"data: {json.dumps(data)}\n\n"
+
+
+def _blocked_event(target: str, reason: str | None) -> str:
     data: dict = {"type": "blocked", "target": target}
     if reason:
         data["reason"] = reason
-    yield f"data: {json.dumps(data)}\n\n"
+    return _sse(data)
 
 
 @app.post("/api/chats/{chat_id}/message")
-async def api_send_message(
-    chat_id: str, req: MessageRequest, background_tasks: BackgroundTasks
-) -> Any:
+async def api_send_message(chat_id: str, req: MessageRequest) -> Any:
     registry = _require_registry()
     svc = _require_service()
-    chat = chat_store.get_chat(chat_id)
-    if chat is None:
+    if chat_store.get_chat(chat_id) is None:
         raise HTTPException(404, "Chat not found")
 
     model_id = req.model_id or registry.default_model_id
@@ -300,77 +394,124 @@ async def api_send_message(
     except KeyError:
         raise HTTPException(400, f"Unknown model: {model_id}")
 
-    # Input guardrail check — runs before appending so blocked messages aren't stored
-    if _guardrail_svc is not None and _guardrails_input:
-        guard = _guardrail_svc.check(req.content)
-        if guard.blocked:
-            logger.info("Input blocked by guardrail: %s", guard.reason)
-            return StreamingResponse(
-                _sse_blocked("input", guard.reason),
-                media_type="text/event-stream",
-                headers=_SSE_HEADERS,
-            )
-
-    # Capture before appending so we can detect the first exchange
-    is_new_chat = chat["name"] == "New Chat"
-
-    chat_store.append_messages(chat_id, "user", req.content, model_id=model_id)
-    messages = _build_messages(chat_store.get_chat(chat_id))
-
-    if _memory_enabled:
-        background_tasks.add_task(_maybe_update_memory, req.content, svc)
-
+    # All blocking work (guardrails, routing, tools, generation) happens inside the
+    # sync generator, which runs in a worker thread — never on the event loop.
     return StreamingResponse(
-        _sse_generator(chat_id, messages, model_id, req.image_base64, svc, is_new_chat, req.content),
+        _close_on_disconnect(_sse_generator(chat_id, req, model_id, svc)),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )
 
 
-def _sse_generator(
-    chat_id: str,
-    messages: list[dict],
-    model_id: str,
-    image_base64: str | None,
-    svc: LLMService,
-    is_new_chat: bool,
-    first_user_content: str,
-):
+async def _close_on_disconnect(gen):
+    """Drive a sync generator from a thread, and close it when the client goes away.
+
+    Starlette stops pulling on disconnect but never closes a sync generator, so the
+    stop button would leave it suspended forever. Closing it raises GeneratorExit at
+    its current yield, which saves the partial reply and closes the provider stream.
+    """
+    try:
+        async for chunk in iterate_in_threadpool(gen):
+            yield chunk
+    finally:
+        threading.Thread(target=_close_when_idle, args=(gen,), daemon=True).start()
+
+
+def _close_when_idle(gen, timeout: float = 120.0) -> None:
+    """gen.close() fails while a step is mid-flight in a worker thread; retry until it lands."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            gen.close()
+            return
+        except ValueError:  # "generator already executing"
+            time.sleep(0.05)
+
+
+def _sse_generator(chat_id: str, req: MessageRequest, model_id: str, svc: LLMService):
+    """Event stream for one user turn.
+
+    Events: status · step · sources · token · blocked · error · done
+    (status/step/sources only appear when the message goes through research).
+    """
+    chat = chat_store.get_chat(chat_id)
+    is_new_chat = chat["name"] == "New Chat"
+    support_note = ""
+
+    # Input guardrail — runs before appending so blocked messages aren't stored
+    if _guardrail_svc is not None and _guardrails_input:
+        guard = _guardrail_svc.check(req.content, "input")
+        if guard.blocked:
+            logger.info("Input blocked by guardrail: %s", guard.reason)
+            yield _blocked_event("input", guard.reason)
+            return
+        if guard.action == "support":
+            support_note = SUPPORT_SYSTEM_NOTE
+
+    chat = chat_store.append_messages(chat_id, "user", req.content, model_id=model_id)
+    messages = _build_messages(chat)
+    messages[0]["content"] += support_note
+
+    if _memory_enabled:
+        threading.Thread(target=_maybe_update_memory, args=(req.content, svc), daemon=True).start()
+
+    # Research — the router decides per message; images skip it (tools can't see them).
+    steps: list[dict] = []
+    sources: list[dict] = []
+    router, agent = _router, _agent
+    if router is not None and agent is not None and not req.image_base64:
+        if router.decide(req.content, chat["messages"]).research:
+            notes = ""
+            for evt in agent.run(chat["messages"], req.content, model_id, context_id=chat_id):
+                if evt.type == "status":
+                    yield _sse({"type": "status", "text": evt.text})
+                elif evt.type == "step":
+                    yield _sse({"type": "step", "step": evt.step})
+                elif evt.type == "done":
+                    notes, sources, steps = evt.notes, evt.sources, evt.steps
+            messages[0]["content"] = build_answer_system(messages[0]["content"], notes)
+            if sources:
+                yield _sse({"type": "sources", "sources": sources})
+            yield _sse({"type": "status", "text": "Writing the answer"})
+
+    extra = {k: v for k, v in (("steps", steps), ("sources", sources)) if v}
     full_response = ""
     try:
         for token in svc.stream(
             messages, model_id,
-            image_base64=image_base64,
+            image_base64=req.image_base64,
             call_type=CALL_TYPE_CHAT,
             context_id=chat_id,
         ):
             full_response += token
-            yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+            yield _sse({"type": "token", "content": token})
+    except GeneratorExit:
+        # The client stopped generation: keep what was written so far.
+        if full_response:
+            chat_store.append_messages(chat_id, "assistant", full_response, extra={**extra, "stopped": True})
+        raise
     except Exception as exc:
         # LLMService already logged the error; just surface it to the client.
-        yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+        yield _sse({"type": "error", "message": str(exc)})
         return
 
     # Output guardrail check — runs after full response is received
     if _guardrail_svc is not None and _guardrails_output:
-        guard = _guardrail_svc.check(full_response)
+        guard = _guardrail_svc.check(full_response, "output")
         if guard.blocked:
             logger.info("Output blocked by guardrail: %s", guard.reason)
-            data: dict = {"type": "blocked", "target": "output"}
-            if guard.reason:
-                data["reason"] = guard.reason
-            yield f"data: {json.dumps(data)}\n\n"
+            yield _blocked_event("output", guard.reason)
             return  # do not store the blocked response
 
-    chat_store.append_messages(chat_id, "assistant", full_response)
+    chat_store.append_messages(chat_id, "assistant", full_response, extra=extra)
 
     # On the first exchange, generate a descriptive title via the cheapest model.
     if is_new_chat:
-        title = svc.generate_title(first_user_content)
+        title = svc.generate_title(req.content)
         chat_store.rename_chat(chat_id, title)
 
     updated = chat_store.get_chat(chat_id)
-    yield f"data: {json.dumps({'type': 'done', 'name': updated['name']})}\n\n"
+    yield _sse({"type": "done", "name": updated["name"]})
 
 
 # ── OpenAI-compatible (/v1/*) ──────────────────────────────────────────

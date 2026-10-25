@@ -12,6 +12,10 @@ protobuf>=4.0.0
 anthropic>=0.40.0
 openai>=1.50.0
 
+# Research tools (free, no API keys): DuckDuckGo web + news search
+ddgs>=9.0
+lxml>=5.0
+
 # Server
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0

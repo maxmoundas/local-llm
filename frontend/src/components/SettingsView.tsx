@@ -1,341 +1,293 @@
-import { useState, useEffect, KeyboardEvent } from 'react'
+import { useEffect, useState, type KeyboardEvent, type ReactNode } from 'react'
 import { api } from '../api/client'
+import { getThemePref, setThemePref, type ThemePref } from '../lib/theme'
 import type { AppSettings } from '../types'
 
-const PROVIDER_LABEL: Record<string, string> = {
-  local: 'Local',
-  anthropic: 'Anthropic',
-  openai: 'OpenAI',
+type Editable = Omit<AppSettings, 'models' | 'jev_configured' | 'default_system_prompt' | 'default_guardrail_prompt'>
+type Tab = 'general' | 'research' | 'jev' | 'safety' | 'memory' | 'models'
+
+const TABS: { id: Tab; label: string }[] = [
+  { id: 'general', label: 'General' },
+  { id: 'research', label: 'Research' },
+  { id: 'jev', label: 'Jev' },
+  { id: 'safety', label: 'Safety' },
+  { id: 'memory', label: 'Memory' },
+  { id: 'models', label: 'Models' },
+]
+
+const PROVIDER_LABEL: Record<string, string> = { local: 'Local', anthropic: 'Anthropic', openai: 'OpenAI' }
+
+function editable(s: AppSettings): Editable {
+  const { models: _m, jev_configured: _j, default_system_prompt: _d, default_guardrail_prompt: _g, ...rest } = s
+  return rest
 }
 
-export default function SettingsView() {
+function Toggle({ checked, onChange, disabled }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
+  return (
+    <label className={`toggle${disabled ? ' disabled' : ''}`}>
+      <input type="checkbox" checked={checked} disabled={disabled} onChange={e => onChange(e.target.checked)} />
+      <span className="toggle-track"><span className="toggle-thumb" /></span>
+    </label>
+  )
+}
+
+function Row({ name, hint, children, stacked }: { name: string; hint?: ReactNode; children: ReactNode; stacked?: boolean }) {
+  return (
+    <div className={`setting-row${stacked ? ' stacked' : ''}`}>
+      <div className="setting-label">
+        <span className="setting-name">{name}</span>
+        {hint && <span className="setting-hint">{hint}</span>}
+      </div>
+      <div className="setting-control">{children}</div>
+    </div>
+  )
+}
+
+function Segmented<T extends string>({ value, options, onChange }: {
+  value: T; options: { value: T; label: string }[]; onChange: (v: T) => void
+}) {
+  return (
+    <div className="segmented" role="radiogroup">
+      {options.map(o => (
+        <button key={o.value} role="radio" aria-checked={value === o.value}
+                className={value === o.value ? 'on' : ''} onClick={() => onChange(o.value)}>
+          {o.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+export default function SettingsView({ onDisplayName }: { onDisplayName: (name: string) => void }) {
   const [settings, setSettings] = useState<AppSettings | null>(null)
-  const [draft, setDraft] = useState<AppSettings | null>(null)
-  const [memoryContent, setMemoryContent] = useState('')
+  const [draft, setDraft] = useState<Editable | null>(null)
+  const [memory, setMemory] = useState('')
   const [memoryDraft, setMemoryDraft] = useState('')
   const [topicInput, setTopicInput] = useState('')
+  const [tab, setTab] = useState<Tab>('general')
+  const [theme, setTheme] = useState<ThemePref>(getThemePref)
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved'>('idle')
 
   useEffect(() => {
     Promise.all([api.getSettings(), api.getMemory()]).then(([s, m]) => {
       setSettings(s)
-      setDraft(s)
-      setMemoryContent(m.content)
+      setDraft(editable(s))
+      setMemory(m.content)
       setMemoryDraft(m.content)
     })
   }, [])
 
-  const isDirty = draft && settings && (
-    draft.cheapest_model_id !== settings.cheapest_model_id ||
-    draft.system_prompt !== settings.system_prompt ||
-    draft.memory_enabled !== settings.memory_enabled ||
-    draft.guardrails_enabled !== settings.guardrails_enabled ||
-    draft.guardrails_input !== settings.guardrails_input ||
-    draft.guardrails_output !== settings.guardrails_output ||
-    draft.guardrails_prompt !== settings.guardrails_prompt ||
-    JSON.stringify(draft.guardrails_topics) !== JSON.stringify(settings.guardrails_topics) ||
-    memoryDraft !== memoryContent
-  )
+  if (!settings || !draft) return <div className="settings-loading">Loading…</div>
 
-  const handleSave = async () => {
-    if (!draft) return
+  const set = <K extends keyof Editable>(key: K, value: Editable[K]) => setDraft({ ...draft, [key]: value })
+  const dirty = JSON.stringify(draft) !== JSON.stringify(editable(settings)) || memoryDraft !== memory
+
+  const save = async () => {
     setSaveState('saving')
-    const [updated] = await Promise.all([
-      api.updateSettings({
-        cheapest_model_id: draft.cheapest_model_id,
-        system_prompt: draft.system_prompt,
-        memory_enabled: draft.memory_enabled,
-        guardrails_enabled: draft.guardrails_enabled,
-        guardrails_input: draft.guardrails_input,
-        guardrails_output: draft.guardrails_output,
-        guardrails_prompt: draft.guardrails_prompt,
-        guardrails_topics: draft.guardrails_topics,
-      }),
-      api.updateMemory(memoryDraft),
-    ])
-    setSettings({ ...updated, models: draft.models })
-    setDraft(prev => prev ? { ...prev, ...updated } : prev)
-    setMemoryContent(memoryDraft)
+    const [updated] = await Promise.all([api.updateSettings(draft), api.updateMemory(memoryDraft)])
+    const merged = { ...settings, ...updated }
+    setSettings(merged)
+    setDraft(editable(merged))
+    setMemory(memoryDraft)
+    onDisplayName(updated.display_name ?? '')
     setSaveState('saved')
-    setTimeout(() => setSaveState('idle'), 2000)
+    setTimeout(() => setSaveState('idle'), 1800)
   }
 
   const addTopic = () => {
-    const val = topicInput.trim()
-    if (!val || !draft || draft.guardrails_topics.includes(val)) return
-    setDraft({ ...draft, guardrails_topics: [...draft.guardrails_topics, val] })
+    const t = topicInput.trim()
+    if (t && !draft.guardrails_topics.includes(t)) set('guardrails_topics', [...draft.guardrails_topics, t])
     setTopicInput('')
   }
 
-  const removeTopic = (topic: string) => {
-    if (!draft) return
-    setDraft({ ...draft, guardrails_topics: draft.guardrails_topics.filter(t => t !== topic) })
-  }
+  const jevStatus = !settings.jev_configured
+    ? { cls: 'off', text: 'No API key' }
+    : draft.jev_enabled ? { cls: 'on', text: 'Connected' } : { cls: 'off', text: 'Turned off' }
+  const jevActive = settings.jev_configured && draft.jev_enabled
 
-  const handleTopicKey = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter') { e.preventDefault(); addTopic() }
-  }
-
-  if (!draft) return <div className="settings-loading">Loading…</div>
-
-  const byProvider = draft.models.reduce<Record<string, typeof draft.models>>((acc, m) => {
+  const byProvider = settings.models.reduce<Record<string, typeof settings.models>>((acc, m) => {
     ;(acc[m.provider] ??= []).push(m)
     return acc
   }, {})
 
-  const isPromptDefault = draft.system_prompt === draft.default_system_prompt
-  const isGuardPromptDefault = draft.guardrails_prompt === draft.default_guardrail_prompt
-
   return (
-    <div className="settings-view">
-      <div className="settings-header">
-        <h1 className="settings-title">Settings</h1>
-      </div>
-
-      <div className="settings-body">
-
-        {/* ── Guardrails ─────────────────────────────────────────── */}
-        <section className="settings-section">
-          <div className="settings-section-header">
-            <h2 className="settings-section-title">Guardrails</h2>
-            <p className="settings-section-desc">
-              Safety checks on messages using the cheapest model. Input checks block
-              before storing; output checks run after generation.
-            </p>
-          </div>
-
-          <div className="settings-row">
-            <div className="settings-row-label">
-              <span className="settings-row-name">Enable guardrails</span>
-              <span className="settings-row-hint">Master toggle for all safety checks</span>
-            </div>
-            <label className="toggle-switch">
-              <input
-                type="checkbox"
-                checked={draft.guardrails_enabled}
-                onChange={e => setDraft({ ...draft, guardrails_enabled: e.target.checked })}
-              />
-              <span className="toggle-slider" />
-            </label>
-          </div>
-
-          {draft.guardrails_enabled && (<>
-            <div className="settings-row">
-              <div className="settings-row-label">
-                <span className="settings-row-name">Check inputs</span>
-                <span className="settings-row-hint">Block user messages before they're sent</span>
-              </div>
-              <label className="toggle-switch">
-                <input
-                  type="checkbox"
-                  checked={draft.guardrails_input}
-                  onChange={e => setDraft({ ...draft, guardrails_input: e.target.checked })}
-                />
-                <span className="toggle-slider" />
-              </label>
-            </div>
-
-            <div className="settings-row">
-              <div className="settings-row-label">
-                <span className="settings-row-name">Check outputs</span>
-                <span className="settings-row-hint">Block assistant responses after generation</span>
-              </div>
-              <label className="toggle-switch">
-                <input
-                  type="checkbox"
-                  checked={draft.guardrails_output}
-                  onChange={e => setDraft({ ...draft, guardrails_output: e.target.checked })}
-                />
-                <span className="toggle-slider" />
-              </label>
-            </div>
-
-            {/* Denied topics */}
-            <div className="settings-prompt-block">
-              <label className="settings-row-name" style={{ marginBottom: 8 }}>
-                Denied topics
-                <span className="settings-row-hint" style={{ display: 'block', fontWeight: 400, marginTop: 2 }}>
-                  Block messages about specific subjects. Leave empty for general safety only.
-                </span>
-              </label>
-
-              {draft.guardrails_topics.length > 0 && (
-                <div className="settings-topics-list">
-                  {draft.guardrails_topics.map(t => (
-                    <span key={t} className="settings-topic-tag">
-                      {t}
-                      <button className="settings-topic-remove" onClick={() => removeTopic(t)} title="Remove">×</button>
-                    </span>
-                  ))}
-                </div>
-              )}
-
-              <div className="settings-topic-input-row">
-                <input
-                  className="settings-topic-input"
-                  value={topicInput}
-                  onChange={e => setTopicInput(e.target.value)}
-                  onKeyDown={handleTopicKey}
-                  placeholder="e.g. competitor products, internal pricing…"
-                />
-                <button
-                  className="settings-topic-add-btn"
-                  onClick={addTopic}
-                  disabled={!topicInput.trim()}
-                >
-                  Add topic
-                </button>
-              </div>
-            </div>
-
-            {/* Guardrail prompt */}
-            <div className="settings-prompt-block">
-              <label className="settings-row-name" style={{ marginBottom: 4 }}>
-                Guardrail prompt
-                <span className="settings-row-hint" style={{ display: 'block', fontWeight: 400, marginTop: 2 }}>
-                  System prompt for the safety classifier. Must instruct the model to return JSON.
-                </span>
-              </label>
-              <textarea
-                className="settings-prompt-textarea"
-                value={draft.guardrails_prompt}
-                onChange={e => setDraft({ ...draft, guardrails_prompt: e.target.value })}
-                rows={7}
-                spellCheck={false}
-              />
-              {!isGuardPromptDefault && (
-                <button
-                  className="settings-prompt-reset"
-                  onClick={() => setDraft({ ...draft, guardrails_prompt: draft.default_guardrail_prompt })}
-                >
-                  Reset to default
-                </button>
-              )}
-            </div>
-          </>)}
-        </section>
-
-        {/* ── Memory ────────────────────────────────────────────── */}
-        <section className="settings-section">
-          <div className="settings-section-header">
-            <h2 className="settings-section-title">Memory</h2>
-            <p className="settings-section-desc">
-              When enabled, the assistant automatically learns durable facts about you
-              from your messages and uses them to personalise future responses.
-            </p>
-          </div>
-
-          <div className="settings-row">
-            <div className="settings-row-label">
-              <span className="settings-row-name">Enable memory</span>
-              <span className="settings-row-hint">Facts are extracted after each message</span>
-            </div>
-            <label className="toggle-switch">
-              <input
-                type="checkbox"
-                checked={draft.memory_enabled}
-                onChange={e => setDraft({ ...draft, memory_enabled: e.target.checked })}
-              />
-              <span className="toggle-slider" />
-            </label>
-          </div>
-
-          {draft.memory_enabled && (
-            <div className="settings-prompt-block">
-              <label className="settings-row-name" style={{ marginBottom: 4 }}>
-                Memory contents
-              </label>
-              <textarea
-                className="settings-prompt-textarea"
-                value={memoryDraft}
-                onChange={e => setMemoryDraft(e.target.value)}
-                rows={6}
-                spellCheck={false}
-                placeholder="Nothing remembered yet — the assistant will fill this in automatically."
-              />
-              {memoryDraft && (
-                <button className="settings-prompt-reset" onClick={() => setMemoryDraft('')}>
-                  Clear memory
-                </button>
-              )}
-            </div>
-          )}
-        </section>
-
-        {/* ── System prompt ──────────────────────────────────────── */}
-        <section className="settings-section">
-          <div className="settings-section-header">
-            <h2 className="settings-section-title">System Prompt</h2>
-            <p className="settings-section-desc">
-              Instructions sent to the model at the start of every conversation.
-              Customise the assistant's personality, tone, or domain focus.
-            </p>
-          </div>
-
-          <div className="settings-prompt-block">
-            <textarea
-              className="settings-prompt-textarea"
-              value={draft.system_prompt}
-              onChange={e => setDraft({ ...draft, system_prompt: e.target.value })}
-              rows={6}
-              spellCheck={false}
-            />
-            {!isPromptDefault && (
-              <button
-                className="settings-prompt-reset"
-                onClick={() => setDraft({ ...draft, system_prompt: draft.default_system_prompt })}
-              >
-                Reset to default
-              </button>
-            )}
-          </div>
-        </section>
-
-        {/* ── Utility model ─────────────────────────────────────── */}
-        <section className="settings-section">
-          <div className="settings-section-header">
-            <h2 className="settings-section-title">Utility Model</h2>
-            <p className="settings-section-desc">
-              Used for background tasks: naming conversations, updating memory, and
-              running guardrail checks. Pick your cheapest model to keep costs low.
-            </p>
-          </div>
-
-          <div className="settings-row">
-            <div className="settings-row-label">
-              <span className="settings-row-name">Cheapest model</span>
-              <span className="settings-row-hint">Background tasks use this model</span>
-            </div>
-            <select
-              className="settings-select"
-              value={draft.cheapest_model_id ?? ''}
-              onChange={e => setDraft({ ...draft, cheapest_model_id: e.target.value || null })}
-            >
-              <option value="">Auto (provider default)</option>
-              {Object.entries(byProvider).map(([provider, models]) => (
-                <optgroup key={provider} label={PROVIDER_LABEL[provider] ?? provider}>
-                  {models.map(m => (
-                    <option key={m.id} value={m.id}>
-                      {m.name}{m.is_cheapest ? ' ★' : ''}
-                    </option>
-                  ))}
-                </optgroup>
+    <div className="settings">
+      <div className="settings-scroll">
+        <div className="settings-inner">
+          <h1 className="settings-title">Settings</h1>
+          <div className="settings-layout">
+            <nav className="settings-tabs">
+              {TABS.map(t => (
+                <button key={t.id} className={tab === t.id ? 'active' : ''} onClick={() => setTab(t.id)}>{t.label}</button>
               ))}
-            </select>
+            </nav>
+
+            <div className="settings-panel">
+              {tab === 'general' && (<>
+                <Row name="What should we call you?" hint="Used in the greeting on new chats.">
+                  <input className="text-input" value={draft.display_name}
+                         onChange={e => set('display_name', e.target.value)} placeholder="Your name" />
+                </Row>
+                <Row name="Appearance" hint="System follows your OS light/dark setting.">
+                  <Segmented value={theme} onChange={v => { setTheme(v); setThemePref(v) }} options={[
+                    { value: 'system', label: 'System' }, { value: 'light', label: 'Light' }, { value: 'dark', label: 'Dark' },
+                  ]} />
+                </Row>
+                <Row stacked name="System prompt" hint="Instructions sent at the start of every conversation.">
+                  <textarea className="text-area" rows={7} value={draft.system_prompt}
+                            onChange={e => set('system_prompt', e.target.value)} />
+                  {draft.system_prompt !== settings.default_system_prompt && (
+                    <button className="link-btn" onClick={() => set('system_prompt', settings.default_system_prompt)}>Reset to default</button>
+                  )}
+                </Row>
+              </>)}
+
+              {tab === 'research' && (<>
+                <p className="settings-intro">
+                  For questions that need current information, the assistant plans a few steps — web and news search,
+                  reading pages, checking the weather — reviews what it found, and then answers with sources.
+                  A router decides per message, so everyday questions are answered directly.
+                </p>
+                <Row name="Multi-step research" hint="Turn off to always answer directly from the model.">
+                  <Toggle checked={draft.agent_enabled} onChange={v => set('agent_enabled', v)} />
+                </Row>
+                <Row name="Maximum research steps" hint="Each step can run several searches or page reads in parallel.">
+                  <select className="select" value={draft.agent_max_steps} disabled={!draft.agent_enabled}
+                          onChange={e => set('agent_max_steps', Number(e.target.value))}>
+                    {[1, 2, 3, 4, 5, 6, 8].map(n => <option key={n} value={n}>{n}</option>)}
+                  </select>
+                </Row>
+                <Row name="Router" hint={jevActive && draft.jev_routing
+                  ? 'Jev decides when to research and when the findings are enough.'
+                  : 'The utility model decides when to research; the planner decides when to stop.'}>
+                  <span className="muted-text">{jevActive && draft.jev_routing ? 'Jev' : 'Utility model'}</span>
+                </Row>
+              </>)}
+
+              {tab === 'jev' && (<>
+                <p className="settings-intro">
+                  Jev is TypeSafe&apos;s System One model: instead of writing text, it answers typed yes/no, choice and
+                  score questions in well under a second. It handles the app&apos;s quick decisions. Anything you turn
+                  off here falls back to the utility model.
+                </p>
+                <Row name="Status" hint={settings.jev_configured ? undefined : <>Add <code>TYPESAFE_API_KEY</code> to <code>backend/.env</code> and restart.</>}>
+                  <span className={`status-pill ${jevStatus.cls}`}>{jevStatus.text}</span>
+                </Row>
+                <Row name="Use Jev" hint="Master switch for every Jev decision.">
+                  <Toggle checked={draft.jev_enabled} disabled={!settings.jev_configured} onChange={v => set('jev_enabled', v)} />
+                </Row>
+                <Row name="Model">
+                  <select className="select" value={draft.jev_model} disabled={!jevActive}
+                          onChange={e => set('jev_model', e.target.value)}>
+                    <option value="jev-latest">jev-latest</option>
+                    <option value="jev-preview">jev-preview</option>
+                  </select>
+                </Row>
+                <h2 className="settings-subhead">Use Jev for</h2>
+                <Row name="Research routing" hint="Whether a message needs research, and whether the findings are enough.">
+                  <Toggle checked={draft.jev_routing} disabled={!jevActive} onChange={v => set('jev_routing', v)} />
+                </Row>
+                <Row name="Safety checks" hint="Hazard probabilities and harm severity for each message.">
+                  <Toggle checked={draft.jev_guardrails} disabled={!jevActive} onChange={v => set('jev_guardrails', v)} />
+                </Row>
+                <Row name="Memory gating" hint="Skips memory extraction on messages with nothing worth remembering.">
+                  <Toggle checked={draft.jev_memory} disabled={!jevActive} onChange={v => set('jev_memory', v)} />
+                </Row>
+              </>)}
+
+              {tab === 'safety' && (<>
+                <Row name="Safety checks" hint="Screen messages for jailbreaks, harmful requests, and denied topics.">
+                  <Toggle checked={draft.guardrails_enabled} onChange={v => set('guardrails_enabled', v)} />
+                </Row>
+                {draft.guardrails_enabled && (<>
+                  <Row name="Check my messages" hint="Blocked messages are never sent or saved.">
+                    <Toggle checked={draft.guardrails_input} onChange={v => set('guardrails_input', v)} />
+                  </Row>
+                  <Row name="Check responses" hint="Runs after each reply; adds a little latency.">
+                    <Toggle checked={draft.guardrails_output} onChange={v => set('guardrails_output', v)} />
+                  </Row>
+                  {jevActive && draft.jev_guardrails && (
+                    <Row name="Policy" hint="Permissive only blocks when Jev is very sure.">
+                      <Segmented value={draft.guardrails_policy} onChange={v => set('guardrails_policy', v)} options={[
+                        { value: 'strict', label: 'Strict' }, { value: 'permissive', label: 'Permissive' },
+                      ]} />
+                    </Row>
+                  )}
+                  <Row stacked name="Denied topics" hint="Also block anything about these subjects.">
+                    {draft.guardrails_topics.length > 0 && (
+                      <div className="tags">
+                        {draft.guardrails_topics.map(t => (
+                          <span key={t} className="tag">
+                            {t}
+                            <button onClick={() => set('guardrails_topics', draft.guardrails_topics.filter(x => x !== t))}
+                                    aria-label={`Remove ${t}`}>×</button>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    <div className="inline-input">
+                      <input className="text-input" value={topicInput} placeholder="e.g. competitor products"
+                             onChange={e => setTopicInput(e.target.value)}
+                             onKeyDown={(e: KeyboardEvent<HTMLInputElement>) => { if (e.key === 'Enter') { e.preventDefault(); addTopic() } }} />
+                      <button className="btn" onClick={addTopic} disabled={!topicInput.trim()}>Add</button>
+                    </div>
+                  </Row>
+                  <details className="advanced">
+                    <summary>Fallback classifier prompt</summary>
+                    <p className="setting-hint">Used when Jev is off or unavailable. Must tell the model to return JSON.</p>
+                    <textarea className="text-area mono" rows={9} value={draft.guardrails_prompt}
+                              onChange={e => set('guardrails_prompt', e.target.value)} />
+                    {draft.guardrails_prompt !== settings.default_guardrail_prompt && (
+                      <button className="link-btn" onClick={() => set('guardrails_prompt', settings.default_guardrail_prompt)}>Reset to default</button>
+                    )}
+                  </details>
+                </>)}
+              </>)}
+
+              {tab === 'memory' && (<>
+                <Row name="Memory" hint="Learn lasting facts about you from your messages and use them in future chats.">
+                  <Toggle checked={draft.memory_enabled} onChange={v => set('memory_enabled', v)} />
+                </Row>
+                {draft.memory_enabled && (
+                  <Row stacked name="What I remember" hint="Edit freely — this is sent with every conversation.">
+                    <textarea className="text-area" rows={8} value={memoryDraft} onChange={e => setMemoryDraft(e.target.value)}
+                              placeholder="Nothing remembered yet." />
+                    {memoryDraft && <button className="link-btn" onClick={() => setMemoryDraft('')}>Clear memory</button>}
+                  </Row>
+                )}
+              </>)}
+
+              {tab === 'models' && (
+                <Row name="Utility model" hint="Writes chat titles, updates memory, and makes any decision Jev isn't handling. Research uses the model you chat with.">
+                  <select className="select" value={draft.cheapest_model_id ?? ''}
+                          onChange={e => set('cheapest_model_id', e.target.value || null)}>
+                    <option value="">Auto (cheapest available)</option>
+                    {Object.entries(byProvider).map(([provider, ms]) => (
+                      <optgroup key={provider} label={PROVIDER_LABEL[provider] ?? provider}>
+                        {ms.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                      </optgroup>
+                    ))}
+                  </select>
+                </Row>
+              )}
+            </div>
           </div>
-        </section>
-
+        </div>
       </div>
 
-      <div className="settings-footer">
-        <button
-          className="settings-save-btn"
-          onClick={handleSave}
-          disabled={!isDirty || saveState === 'saving'}
-        >
-          {saveState === 'saving' ? 'Saving…' : saveState === 'saved' ? 'Saved!' : 'Save changes'}
-        </button>
-      </div>
+      {(dirty || saveState !== 'idle') && (
+        <div className="settings-savebar">
+          <span>{saveState === 'saved' ? 'Saved' : 'You have unsaved changes'}</span>
+          {saveState !== 'saved' && (
+            <>
+              <button className="btn" onClick={() => { setDraft(editable(settings)); setMemoryDraft(memory) }}>Discard</button>
+              <button className="btn primary" onClick={save} disabled={saveState === 'saving'}>
+                {saveState === 'saving' ? 'Saving…' : 'Save changes'}
+              </button>
+            </>
+          )}
+        </div>
+      )}
     </div>
   )
 }

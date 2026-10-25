@@ -29,15 +29,18 @@ class ProviderRegistry:
 
     @property
     def cheapest_model(self) -> ModelOption:
-        """Return the first model flagged is_cheapest=True, or the default model as fallback.
+        """Return the first is_cheapest model whose provider is ready, in registration order.
 
-        Providers are registered in order: local → anthropic → openai, so cloud cheap
-        models (haiku, gpt-mini) are preferred over local when both are available.
+        Providers register local → anthropic → openai, so the free local model is used once
+        its weights are loaded, and a cloud cheap model (haiku, gpt-mini) covers until then.
+        Falls back to the first flagged model, then the default model.
         """
-        for provider in self._providers:
-            for model in provider.models:
-                if model.is_cheapest:
-                    return model
+        flagged = [(p, m) for p in self._providers for m in p.models if m.is_cheapest]
+        for provider, model in flagged:
+            if provider.ready:
+                return model
+        if flagged:
+            return flagged[0][1]
         return self._providers[0].models[0]
 
 

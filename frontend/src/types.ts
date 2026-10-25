@@ -8,9 +8,23 @@ export interface Chat {
   pinned: boolean
 }
 
+export interface ResearchStep {
+  tool: string
+  label: string
+  summary?: string
+}
+
+export interface SourceRef {
+  title: string
+  url: string
+}
+
 export interface Message {
   role: 'system' | 'user' | 'assistant'
   content: string
+  steps?: ResearchStep[]
+  sources?: SourceRef[]
+  stopped?: boolean
 }
 
 export interface ChatDetail extends Chat {
@@ -22,6 +36,7 @@ export interface HealthStatus {
   status: 'ok' | 'loading'
   model: string | null
   local_model_loaded: boolean
+  jev_available: boolean
 }
 
 export interface ModelOption {
@@ -41,7 +56,17 @@ export interface AppSettings {
   guardrails_output: boolean
   guardrails_prompt: string
   guardrails_topics: string[]
+  guardrails_policy: 'strict' | 'permissive'
   default_guardrail_prompt: string
+  agent_enabled: boolean
+  agent_max_steps: number
+  jev_enabled: boolean
+  jev_model: string
+  jev_routing: boolean
+  jev_guardrails: boolean
+  jev_memory: boolean
+  jev_configured: boolean
+  display_name: string
   models: ModelOption[]
 }
 

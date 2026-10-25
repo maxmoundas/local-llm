@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 
 from openai import OpenAI
 
-from src.providers.base import BaseProvider, ModelOption
+from src.providers.base import BaseProvider, ModelOption, ToolCall, ToolTurn
 
 _MODELS = [
     # ModelOption(id="gpt-5.5", name="GPT-5.5", provider="openai"),      # expensive — uncomment to re-enable
@@ -47,11 +48,34 @@ class OpenAIProvider(BaseProvider):
             if delta.content:
                 yield delta.content
 
-    def complete(self, messages: list[dict], model_id: str) -> str:
+    def complete(self, messages: list[dict], model_id: str, max_tokens: int = 1024) -> str:
         oai_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
         response = self._client.chat.completions.create(
             model=model_id,
             messages=oai_messages,
+            max_completion_tokens=max_tokens,
             stream=False,
         )
         return response.choices[0].message.content or ""
+
+    def complete_with_tools(
+        self, messages: list[dict], model_id: str, tools: list[dict], max_tokens: int = 1024,
+        require: bool = False,
+    ) -> ToolTurn:
+        response = self._client.chat.completions.create(
+            model=model_id,
+            messages=[{"role": m["role"], "content": m["content"]} for m in messages],
+            tools=[{"type": "function", "function": t} for t in tools],
+            tool_choice="required" if require else "auto",
+            max_completion_tokens=max_tokens,
+            stream=False,
+        )
+        message = response.choices[0].message
+        turn = ToolTurn(text=message.content or "")
+        for call in message.tool_calls or []:
+            try:
+                args = json.loads(call.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            turn.tool_calls.append(ToolCall(name=call.function.name, arguments=args, id=call.id))
+        return turn

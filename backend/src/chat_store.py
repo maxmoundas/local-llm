@@ -88,11 +88,14 @@ def rename_chat(chat_id: str, name: str) -> dict | None:
     return chat
 
 
-def append_messages(chat_id: str, role: str, content: str, model_id: str | None = None) -> dict | None:
+def append_messages(
+    chat_id: str, role: str, content: str, model_id: str | None = None, extra: dict | None = None
+) -> dict | None:
+    """Append a message. `extra` adds display-only fields (research steps, sources, stopped)."""
     chat = _read(chat_id)
     if chat is None:
         return None
-    chat["messages"].append({"role": role, "content": content})
+    chat["messages"].append({"role": role, "content": content, **(extra or {})})
     chat["updated_at"] = _now()
     if role == "user" and model_id:
         chat["model_id"] = model_id

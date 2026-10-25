@@ -80,3 +80,18 @@ def test_client(mock_llm, mock_registry) -> TestClient:
     server._registry = mock_registry
     server._llm_service = LLMService(mock_registry)
     return TestClient(server.app)
+
+
+@pytest.fixture(autouse=True)
+def isolate_data_files(tmp_path, monkeypatch):
+    """Keep every test away from the real memory.txt, settings.json, and chats/.
+
+    Message handling starts background memory updates, so any test that sends a
+    message could otherwise write a mocked reply into the user's real memory file.
+    """
+    import src.chat_store as cs
+    import src.memory_store as ms
+    import src.settings_store as ss
+    monkeypatch.setattr(ms, "MEMORY_PATH", tmp_path / "memory.txt")
+    monkeypatch.setattr(ss, "SETTINGS_PATH", tmp_path / "settings.json")
+    monkeypatch.setattr(cs, "CHATS_DIR", tmp_path / "chats")

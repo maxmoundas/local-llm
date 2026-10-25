@@ -52,3 +52,7 @@ Thumbs.db
 
 # Claude Code internal
 .claude/
+
+# Personal runtime data (created on first use; defaults live in settings_store.py)
+backend/memory.txt
+backend/settings.json

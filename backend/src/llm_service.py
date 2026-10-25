@@ -15,6 +15,7 @@ import time
 from collections.abc import Iterator
 
 from src.logger import get_logger
+from src.providers.base import ToolTurn
 from src.providers.registry import ProviderRegistry
 
 _log = get_logger(__name__)
@@ -26,6 +27,8 @@ CALL_TYPE_CHAT   = "chat_response"    # main user↔assistant exchange
 CALL_TYPE_TITLE  = "title_generation" # naming a new conversation
 CALL_TYPE_MEMORY = "memory_update"    # extracting durable user facts
 CALL_TYPE_GUARD  = "guardrail_check"  # content safety classification
+CALL_TYPE_AGENT  = "agent_step"       # one tool-selection turn in the research loop
+CALL_TYPE_ROUTE  = "research_routing" # LLM fallback when Jev is unavailable
 
 
 def _short(model_id: str) -> str:
@@ -54,10 +57,11 @@ class LLMService:
     def _resolve_cheapest_id(self) -> str:
         """Return the effective cheapest model ID, honouring any saved override."""
         if self._cheapest_override:
-            # Verify the override still exists; fall back silently if it doesn't.
+            # Use the override only if it still exists and can serve requests right now
+            # (a local model that is still loading would fail every utility call).
             try:
-                self._registry.get_provider(self._cheapest_override)
-                return self._cheapest_override
+                if self._registry.get_provider(self._cheapest_override).ready:
+                    return self._cheapest_override
             except KeyError:
                 pass
         return self._registry.cheapest_model.id
@@ -109,6 +113,7 @@ class LLMService:
         messages: list[dict],
         model_id: str | None = None,
         call_type: str = CALL_TYPE_TITLE,
+        max_tokens: int | None = None,
     ) -> str:
         """Non-streaming completion with full lifecycle logging.
 
@@ -122,7 +127,10 @@ class LLMService:
         _log.info("[%s] start | model=%s", call_type, _short(model_id))
         t0 = time.monotonic()
         try:
-            result = provider.complete(messages, model_id)
+            if max_tokens is None:
+                result = provider.complete(messages, model_id)
+            else:
+                result = provider.complete(messages, model_id, max_tokens=max_tokens)
             elapsed = time.monotonic() - t0
             tokens = provider.count_tokens(result)
             _log.info("[%s] done  | model=%s | tokens≈%d | %.1fs",
@@ -131,6 +139,33 @@ class LLMService:
         except Exception as exc:
             _log.error("[%s] error | model=%s | %s", call_type, _short(model_id), exc)
             raise
+
+    def complete_with_tools(
+        self,
+        messages: list[dict],
+        model_id: str,
+        tools: list[dict],
+        call_type: str = CALL_TYPE_AGENT,
+        context_id: str = "",
+        require: bool = False,
+    ) -> ToolTurn:
+        """One tool-selection turn: returns the tool calls the model wants to make next.
+
+        `require` forces at least one call (used on the first step, once the router has
+        already decided the message needs research).
+        """
+        provider = self._registry.get_provider(model_id)
+        ctx = f"id={context_id[:8]} | " if context_id else ""
+        _log.info("[%s] start | %smodel=%s | tools=%d", call_type, ctx, _short(model_id), len(tools))
+        t0 = time.monotonic()
+        try:
+            turn = provider.complete_with_tools(messages, model_id, tools, require=require)
+        except Exception as exc:
+            _log.error("[%s] error | %smodel=%s | %s", call_type, ctx, _short(model_id), exc)
+            raise
+        _log.info("[%s] done  | %smodel=%s | calls=%s | %.1fs", call_type, ctx, _short(model_id),
+                  [c.name for c in turn.tool_calls], time.monotonic() - t0)
+        return turn
 
     def count_tokens(self, model_id: str, text: str) -> int:
         """Estimate token count via the provider for model_id."""

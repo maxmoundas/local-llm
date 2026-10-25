@@ -40,8 +40,21 @@ _DEFAULTS: dict = {
     "guardrails_enabled": False,
     "guardrails_input": True,   # check user messages
     "guardrails_output": False,  # check assistant responses (adds latency)
-    "guardrails_prompt": DEFAULT_GUARDRAIL_PROMPT,
+    "guardrails_prompt": DEFAULT_GUARDRAIL_PROMPT,  # LLM fallback engine only
     "guardrails_topics": [],    # extra denied topics (empty = general safety only)
+    "guardrails_policy": "strict",  # Jev thresholds: strict | permissive
+    # Research (multi-step web research, chosen per message by the router)
+    "agent_enabled": True,
+    "agent_max_steps": 4,       # planner turns per message; each turn may run several tools
+    # Jev (TypeSafe System One) — fast structured decisions. Each use can be turned off;
+    # when off (or Jev is unreachable) that feature falls back to the cheapest LLM.
+    "jev_enabled": True,
+    "jev_model": "jev-latest",
+    "jev_routing": True,        # decide when to research, and when research is complete
+    "jev_guardrails": True,     # safety checks
+    "jev_memory": True,         # skip memory extraction on messages with nothing to remember
+    # Display name used in the greeting on the new-chat screen
+    "display_name": "",
 }
 
 

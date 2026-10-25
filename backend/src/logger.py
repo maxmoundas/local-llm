@@ -30,6 +30,10 @@ def setup_logging(cfg: dict[str, Any]) -> None:
     root.addHandler(file_handler)
 
     if log_cfg.get("console", True):
+        # Windows consoles default to cp1252; replace unencodable characters (≈, —, “”)
+        # instead of raising a logging error on every such line.
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(errors="replace")
         stream_handler = logging.StreamHandler(sys.stdout)
         stream_handler.setFormatter(fmt)
         root.addHandler(stream_handler)

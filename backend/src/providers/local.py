@@ -23,6 +23,10 @@ class LocalProvider(BaseProvider):
         short_name = self._llm.repo_id.split("/")[-1]
         return [ModelOption(id=self._llm.repo_id, name=short_name, provider="local", is_cheapest=True)]
 
+    @property
+    def ready(self) -> bool:
+        return self._llm.is_loaded
+
     def stream(self, messages: list[dict], model_id: str, image_base64: str | None = None) -> Iterator[str]:
         if not self._llm.is_loaded:
             raise RuntimeError("Local model is still loading — please wait a moment and try again")
@@ -32,10 +36,12 @@ class LocalProvider(BaseProvider):
             return self._llm.stream_with_image(image, messages)
         return self._llm.stream(messages)
 
-    def complete(self, messages: list[dict], model_id: str) -> str:
+    def complete(self, messages: list[dict], model_id: str, max_tokens: int | None = None) -> str:
         if not self._llm.is_loaded:
             raise RuntimeError("Local model is still loading — please wait a moment and try again")
-        return self._llm.generate(messages)
+        if max_tokens is None:
+            return self._llm.generate(messages)
+        return self._llm.generate(messages, max_new_tokens=max_tokens)
 
     def count_tokens(self, text: str) -> int:
         if not self._llm.is_loaded:
