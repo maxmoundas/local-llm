@@ -14,11 +14,14 @@ A self-hosted, Claude-style chat app for running Google Gemma 4 locally, with An
 - **Long chats** — history is fitted to each model's context window; older turns are summarized by the utility model.
 - **Projects** — groups of chats sharing instructions, knowledge files, and their own memory.
 - **Per-chat settings** — a custom system prompt, temperature (models that accept one), and reasoning effort (Claude, GPT-5).
-- **Search** — full text over every message, with snippets; jumps to the matching message.
+- **Search** — full text over every message (SQLite FTS5 index, any substring), with snippets; jumps to the matching message.
 - **Previews** — HTML, SVG, and Mermaid code blocks open in a side panel; files the agent creates (images, CSV as a
   table, text, Markdown, HTML) preview inline instead of only downloading.
 - **Scheduled tasks** — prompts that run daily, on chosen weekdays, or every N minutes, each posting to its own chat.
-- **Usage** — spend by day, model, and chat, plus an optional monthly limit that pauses new turns.
+- **Usage** — spend by day, model, and chat (including memory extraction, titles, and `/v1` calls), plus an optional
+  monthly limit that pauses new turns.
+- **Backup & restore** — one zip with chats, files, projects, memory, settings, and schedules (Settings → General).
+- **One-process mode** — `./start.sh --prod` builds the UI and the backend serves it at http://localhost:8000.
 - **Voice input** — local speech-to-text with Whisper (`faster-whisper`), no cloud calls.
 - **Keyboard shortcuts** — ⌘/Ctrl+Shift+O new chat, ⌘K search, ⌘B sidebar, Shift+Esc focus input, ⌘/ for the list.
 - **Safe by default on the network** — loopback-only unless you set an access token (see [Security](#security)).
@@ -63,7 +66,7 @@ The backend is a FastAPI application (`backend/serve.py`) running on port 8000.
 
 ### Agent (research, code, connectors)
 
-When a message needs tools, the assistant works on it step by step as a **background task**: it plans, calls tools (several in parallel), reads the results, and repeats until done, then writes the answer. Each step shows as a one-line update ("Searching the web for “…”", "Running code: load sales.csv", "Reading nytimes.com") in an animated timeline. Tasks keep running if the tab closes; reopening the chat reattaches to the live task.
+When a message needs tools, the assistant works on it step by step as a **background task**: it plans, calls tools (several in parallel), reads the results, and repeats until done, then writes the answer. Images can be attached to such messages too: the planner can't see them, but they're copied into the workspace for code, and the vision model that writes the answer sees them. Each step shows as a one-line update ("Searching the web for “…”", "Running code: load sales.csv", "Reading nytimes.com") in an animated timeline. Tasks keep running if the tab closes; reopening the chat reattaches to the live task.
 
 ```
 message ─► router ── no ──► answer directly
@@ -79,7 +82,8 @@ message ─► router ── no ──► answer directly
 
 - **`src/agent/runner.py`** — `TaskAgent`. Stateless turns over a rendered work log, so every model (native or prompted tool calling) runs the same loop. Every tool gets an optional `status` argument the model fills with the user-facing line (no extra LLM calls); templates are the fallback. Internal tools: `update_plan` (a private plan) and `ask_user` (pauses for your answer). Old log entries are trimmed, then folded into a summary by the cheapest model when the log outgrows the model's context. Stops on step, spending, and time limits, or after repeated failures.
 - **`src/agent/tools.py`** — free, keyless research tools: `web_search`, `news_search`, `fetch_page`, `get_weather`.
-- **`src/agent/sandbox.py` + `workspace_tools.py`** — `run_code` (python/bash/node), `write_file`, `read_file`, `list_files` in a per-task workspace. Code runs in a Docker container per task (`python:3.12-slim`, CPU/memory/pid limits, no host env vars, network optional); files the agent creates appear as downloads under the answer. Without Docker, code tools are off unless you choose the unsandboxed "Local" mode in Settings.
+- **`src/agent/sandbox.py` + `workspace_tools.py`** — `run_code` (python, bash, and javascript where the sandbox has Node — the default `python:3.12-slim` image doesn't, so Docker offers python and bash), `write_file`, `read_file`, `list_files` in a per-task workspace. Code runs in a Docker container per task (CPU/memory/pid limits, no host env vars, network optional); files the agent creates appear as downloads under the answer. Without Docker, code tools are off unless you choose the unsandboxed "Local" mode in Settings. Workspaces are deleted with their chat and after 30 days (Settings → Agent → *Keep files the agent creates*); containers left behind by a crash are removed at startup.
+- **Prompt-injection guard** — web pages and connector data (email, issues…) can carry instructions aimed at the model. Once a task has read any, tools that can send data out — `run_code` with internet access, and connector tools whose server doesn't mark them read-only — pause for your **Allow / Deny**, with the reason shown. Scheduled runs decline them. Toggle: Settings → Agent → *Ask before sending data out*. (Web searches and page fetches themselves are not gated.)
 - **`src/agent/connectors.py`** — MCP servers from `backend/connectors.yaml` (see `connectors.example.yaml`) become tools for any model: email, calendar, GitHub, files… Tools matching a `confirm` pattern pause for your **Allow / Deny** before running.
 - **`src/agent/router.py`** — decides per message whether tools are needed (Jev, or the utility model), and whether research notes are already sufficient.
 - **`src/tasks/`** — `TaskManager` runs each turn on its own thread with an append-only event log (SQLite, `data/tasks.db`); `turn.py` is the per-message flow (guardrails → routing → agent → answer → title).
@@ -105,17 +109,17 @@ React + TypeScript + Vite, styled after the Claude app (warm neutrals, serif res
 - `App.tsx` -- layout and top-level state. The new-chat screen creates the chat on first send. Switching models keeps the current chat; the last-used model is remembered.
 - `ChatView.tsx` -- message list and SSE consumer (`lib/sse.ts`); follows the stream while you're at the bottom; **Stop** aborts the request and the partial reply is kept.
 - `Message.tsx` / `Markdown.tsx` -- user bubbles, assistant prose (GFM tables, code blocks with copy).
-- `ResearchSteps.tsx` -- the live status line while researching, collapsing to "Researched · N steps · M sources" with the step list and source chips.
+- `Activity.tsx` -- the live status line while the agent works, the step list and source chips, and the question / approval cards.
 - `Composer.tsx` / `ModelMenu.tsx` -- input card with image attach/paste/drop, model menu, send/stop.
 - `Sidebar.tsx` -- collapsible; New chat, full-text Search, Scheduled, Projects, Starred, Recents, per-chat menu (star, rename, generate title, move to project, export, delete).
 - `ProjectView.tsx` / `SchedulesView.tsx` -- project page (instructions, files, memory, chats) and scheduled tasks.
 - `PreviewPanel.tsx` -- side panel for HTML/SVG/Mermaid code and agent files (sandboxed iframes; no access to the app).
 - `ChatSettingsMenu.tsx` -- per-chat system prompt, temperature, and reasoning effort.
-- `SettingsView.tsx` / `UsageTab.tsx` -- General (incl. voice, network status), Usage, Agent, Jev, Safety, Memory, Models.
+- `SettingsView.tsx` / `UsageTab.tsx` -- General (incl. voice, network status, backup & restore), Usage, Agent, Jev, Safety, Memory, Models.
 
 ### Chat persistence
 
-Each conversation is stored as a JSON file in `backend/chats/`, named by UUID (`{chat_id}.json`), with its attached files in `backend/chats/{chat_id}/files/` (original + extracted text + metadata). Projects live in `backend/projects/`, schedules in `backend/data/schedules.json`. There is no database besides the task log. The schema per chat file:
+Each conversation is stored as a JSON file in `backend/chats/`, named by UUID (`{chat_id}.json`), with its attached files in `backend/chats/{chat_id}/files/` (original + extracted text + metadata). Projects live in `backend/projects/`, schedules in `backend/data/schedules.json`. The only databases are the task log (`data/tasks.db`, which also holds usage) and the search index (`chats/search.db`, rebuilt from the chat files if deleted). The schema per chat file:
 
 ```json
 {
@@ -185,7 +189,7 @@ Real token usage is read from every API response; the agent can use a cheaper mo
 
 | Dependency | Version |
 |---|---|
-| Python | 3.12+ |
+| Python | 3.11+ |
 | Node.js | 18+ |
 | CUDA | 12+ |
 | VRAM | 8 GB minimum, 12 GB recommended |
@@ -207,44 +211,42 @@ Whisper model chosen in Settings → General).
 local-llm/
 ├── backend/
 │   ├── src/
-│   │   ├── model.py              # LocalLLM: HF Transformers, 4-bit quant, streaming
-│   │   ├── server.py             # FastAPI routes, SSE streaming, OpenAI endpoint
+│   │   ├── server.py             # FastAPI routes, SSE, OpenAI-compatible /v1, serves the built UI
 │   │   ├── llm_service.py        # every LLM call: routing, logging, tool turns
+│   │   ├── model.py / model_mlx.py / model_factory.py   # in-process model (CUDA or Apple Silicon)
 │   │   ├── decision_service.py   # Jev client + DecisionService (typed decisions)
 │   │   ├── guardrail_service.py  # safety checks (Jev battery, LLM fallback)
 │   │   ├── agent/
-│   │   │   ├── router.py         # research? / enough? decisions
-│   │   │   ├── runner.py         # ResearchAgent loop (status/step/done events)
-│   │   │   └── tools.py          # web_search, news_search, fetch_page, get_weather
+│   │   │   ├── router.py         # needs tools? / enough? decisions
+│   │   │   ├── runner.py         # TaskAgent loop, approvals, untrusted-content guard
+│   │   │   ├── tools.py          # web_search, news_search, fetch_page, get_weather
+│   │   │   ├── sandbox.py        # Docker / local code execution, workspace cleanup
+│   │   │   ├── workspace_tools.py  # run_code, read/write/list files
+│   │   │   └── connectors.py     # MCP servers as tools
+│   │   ├── tasks/                # background task runtime (manager, SQLite store, per-turn flow)
 │   │   ├── chat_store.py         # JSON-file chat persistence
-│   │   ├── memory_store.py / settings_store.py
-│   │   ├── config.py             # config.yaml loader + env overrides
-│   │   ├── logger.py             # Rotating file + console logger
-│   │   └── providers/
-│   │       ├── base.py           # BaseProvider ABC, ModelOption, ToolCall/ToolTurn
-│   │       ├── local.py          # LocalProvider (wraps LocalLLM)
-│   │       ├── anthropic_provider.py
-│   │       ├── openai_provider.py
-│   │       └── registry.py       # ProviderRegistry + build_registry()
-│   ├── tests/                    # Unit tests (mock-based) + integration tests
-│   ├── scripts/
-│   │   └── download_model.py
-│   ├── config.yaml
-│   ├── .env.example
-│   ├── requirements.txt
-│   ├── pyproject.toml
+│   │   ├── search_index.py       # SQLite FTS5 index for search
+│   │   ├── backup.py             # backup / restore zip
+│   │   ├── project_store.py / memory_store.py / settings_store.py / scheduler.py
+│   │   ├── attachments.py / context.py / usage.py / transcribe.py
+│   │   ├── config.py / logger.py
+│   │   └── providers/            # base, local, anthropic, openai(-compatible), registry
+│   ├── tests/                    # unit tests, fakes, contract suite
+│   ├── scripts/download_model.py
+│   ├── config.yaml / models.yaml / connectors.example.yaml / .env.example
 │   └── serve.py                  # Entry point: python serve.py
 ├── frontend/
 │   ├── src/
 │   │   ├── App.tsx
 │   │   ├── api/client.ts
-│   │   ├── lib/                  # sse.ts (event parser), theme.ts (light/dark)
-│   │   ├── components/           # ChatView, Message, Markdown, ResearchSteps, Composer,
-│   │   │                         # ModelMenu, NewChat, Sidebar, SettingsView, Icons
+│   │   ├── lib/                  # sse.ts, turn.ts (event reducer), preview.ts, theme.ts
+│   │   ├── components/           # ChatView, Message, Markdown, Activity, Composer, ModelMenu, Sidebar,
+│   │   │                         # ProjectView, SchedulesView, SettingsView, UsageTab, PreviewPanel, …
 │   │   ├── styles/global.css     # design tokens (light + dark) and all styles
 │   │   └── types.ts
 │   ├── package.json
 │   └── vite.config.ts            # Proxies /api, /health, /v1 to :8000
+├── start.sh / start.bat          # run both (start.sh --prod: one process)
 ├── models/                       # Downloaded model weights (gitignored)
 └── README.md
 ```
@@ -317,6 +319,10 @@ cd frontend && npm run dev
 - Backend: http://localhost:8000
 - Frontend: http://localhost:5173
 
+Or `./start.sh` to run both. For a single process without the Vite dev server (e.g. to use the app from a phone —
+see [Security](#security)), run `./start.sh --prod`: it builds the frontend and the backend serves it at
+http://localhost:8000. Set `server.frontend_dist` in `config.yaml` to serve a build from elsewhere.
+
 The backend starts accepting requests immediately. The local model loads in the background (typically 1–3 minutes depending on disk speed). Cloud models are usable right away; a loading banner in the UI indicates when the local model is still warming up.
 
 ---
@@ -380,6 +386,8 @@ Environment variable overrides: `MODEL_REPO_ID`, `MODEL_QUANTIZATION`, `SERVER_H
 | `GET` | `/api/usage?days=30` | Spend and tokens by day, model, and chat; month to date |
 | `POST` | `/api/transcribe` | Speech to text: `{ audio_base64, mime }` → `{ text }` |
 | `GET` / `POST` | `/api/auth/status`, `/api/auth/login`, `/api/auth/logout` | Access-token sign-in (see Security) |
+| `GET` | `/api/backup` | Download a backup zip (chats + files, projects, memory, settings, schedules; no API keys) |
+| `POST` | `/api/restore?mode=merge\|replace` | Restore a backup zip sent as the raw body (see `src/backup.py`) |
 
 **`GET /health` response:**
 ```json
@@ -391,15 +399,18 @@ Environment variable overrides: `MODEL_REPO_ID`, `MODEL_QUANTIZATION`, `SERVER_H
 ```json
 {
   "content": "Hello",
-  "model_id": "claude-sonnet-4-6",
-  "image_base64": null
+  "model_id": "claude-sonnet-5-5",
+  "attachments": ["<file id from POST /api/chats/{id}/files>"]
 }
 ```
-`model_id` is optional; omitting it uses the local model. `image_base64` is a base64-encoded image for vision requests.
+`model_id` is optional; omitting it uses the default model. Upload images and documents first with
+`POST /api/chats/{id}/files` and pass their ids in `attachments` (the older single `image_base64` field still works).
 
 ### OpenAI-compatible endpoint
 
-Drop-in replacement for projects already using the OpenAI SDK:
+Drop-in replacement for projects already using the OpenAI SDK — and a single local gateway to every model in
+`models.yaml`. `GET /v1/models` lists them; pass any id as `model` (`"local"` or the repo id means the in-process
+model). Calls to cloud models are metered like chat turns: they show in Usage and count toward the monthly limit.
 
 ```python
 from openai import OpenAI
@@ -412,6 +423,9 @@ response = client.chat.completions.create(
 )
 for chunk in response:
     print(chunk.choices[0].delta.content or "", end="", flush=True)
+
+# Any other configured model works the same way:
+client.chat.completions.create(model="claude-haiku-5-5", messages=[{"role": "user", "content": "Hi"}])
 ```
 
 ### Vision endpoint (non-streaming, local model only)

@@ -21,6 +21,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src import search_index
+
 CHATS_DIR = Path("chats")
 
 # Background tasks and API requests write chats concurrently; every read-modify-write holds this.
@@ -45,14 +47,26 @@ def _path(chat_id: str) -> Path:
     return CHATS_DIR / f"{chat_id}.json"
 
 
+class InvalidChatId(ValueError):
+    """A chat id that isn't a UUID (never a real chat; refuse before touching the filesystem)."""
+
+
+def _valid_id(chat_id: str) -> bool:
+    try:
+        uuid.UUID(chat_id)
+        return True
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
 def files_dir(chat_id: str) -> Path:
+    if not _valid_id(chat_id):
+        raise InvalidChatId(f"Invalid chat id: {chat_id!r}")
     return CHATS_DIR / chat_id / "files"
 
 
 def _read(chat_id: str) -> dict | None:
-    try:
-        uuid.UUID(chat_id)
-    except (ValueError, TypeError):
+    if not _valid_id(chat_id):
         return None
     p = _path(chat_id)
     if not p.exists():
@@ -65,6 +79,7 @@ def _write(chat: dict) -> None:
     tmp = _path(chat["id"]).with_suffix(".json.tmp")
     tmp.write_text(json.dumps(chat, indent=2), encoding="utf-8")
     tmp.replace(_path(chat["id"]))  # atomic: readers never see a half-written file
+    search_index.index_chat(CHATS_DIR, chat, _path(chat["id"]).stat().st_mtime)
 
 
 def _preview(messages: list[dict]) -> str:
@@ -201,6 +216,7 @@ def delete_chat(chat_id: str) -> bool:
         return False
     _path(chat_id).unlink()
     shutil.rmtree(CHATS_DIR / chat_id, ignore_errors=True)
+    search_index.remove_chat(CHATS_DIR, chat_id)
     return True
 
 
@@ -291,6 +307,9 @@ def search(query: str, limit: int = 50) -> list[dict]:
     q = query.strip().lower()
     if not q:
         return []
+    indexed = search_index.search(CHATS_DIR, query, limit)
+    if indexed is not None:
+        return _indexed_results(indexed, q)
     results = []
     for chat in _all():
         hit = None
@@ -307,6 +326,25 @@ def search(query: str, limit: int = 50) -> list[dict]:
             if len(results) >= limit:
                 break
     return results
+
+
+def _indexed_results(hits: list[tuple[str, int, str | None, str]], q: str) -> list[dict]:
+    results = []
+    for chat_id, idx, role, text in hits:
+        chat = _read(chat_id)
+        if chat is None:
+            continue
+        if idx < 0:
+            hit = {"index": None, "role": None, "snippet": _preview(chat.get("messages", []))}
+        else:
+            hit = {"index": idx, "role": role, "snippet": _snippet(text, max(text.lower().find(q), 0), len(q))}
+        results.append({**_summary(chat), **hit})
+    return results
+
+
+def sync_search_index() -> int:
+    """Bring the search index up to date with the chat files (run at startup)."""
+    return search_index.sync(CHATS_DIR)
 
 
 def export_markdown(chat: dict) -> str:

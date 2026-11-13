@@ -28,11 +28,17 @@ def set_price(model_id: str, input_per_mtok: float, output_per_mtok: float) -> N
         _prices[model_id] = (float(input_per_mtok), float(output_per_mtok))
 
 
-def cost(model_id: str, input_tokens: int, output_tokens: int, cached_input_tokens: int = 0) -> float:
-    """Dollar cost of one call. Cached input is billed at 10% (Anthropic and OpenAI both discount ~90%)."""
+CACHE_READ_RATE = 0.1    # cached input reads: ~90% off (Anthropic and OpenAI)
+CACHE_WRITE_RATE = 1.25  # Anthropic bills writing a prompt-cache entry (5-minute TTL) at 125% of input
+
+
+def cost(model_id: str, input_tokens: int, output_tokens: int, cached_input_tokens: int = 0,
+         cache_write_tokens: int = 0) -> float:
+    """Dollar cost of one call. `input_tokens` is the whole prompt, including cache reads and writes."""
     pin, pout = _prices.get(model_id, (0.0, 0.0))
-    fresh = max(0, input_tokens - cached_input_tokens)
-    return (fresh * pin + cached_input_tokens * pin * 0.1 + output_tokens * pout) / 1_000_000
+    fresh = max(0, input_tokens - cached_input_tokens - cache_write_tokens)
+    return (fresh * pin + cached_input_tokens * pin * CACHE_READ_RATE + cache_write_tokens * pin * CACHE_WRITE_RATE
+            + output_tokens * pout) / 1_000_000
 
 
 @dataclass
@@ -45,8 +51,9 @@ class Meter:
     by_model: dict[str, dict] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    def add(self, model_id: str, input_tokens: int, output_tokens: int, cached_input_tokens: int = 0) -> None:
-        c = cost(model_id, input_tokens, output_tokens, cached_input_tokens)
+    def add(self, model_id: str, input_tokens: int, output_tokens: int, cached_input_tokens: int = 0,
+            cache_write_tokens: int = 0) -> None:
+        c = cost(model_id, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens)
         with self._lock:
             self.input_tokens += input_tokens
             self.output_tokens += output_tokens
@@ -59,6 +66,12 @@ class Meter:
             m["cost_usd"] += c
             m["calls"] += 1
 
+    def full_snapshot(self) -> dict:
+        """snapshot() plus the per-model breakdown, as stored for the usage dashboard."""
+        with self._lock:
+            by_model = {k: dict(v) for k, v in self.by_model.items()}
+        return {**self.snapshot(), "by_model": by_model}
+
     def snapshot(self) -> dict:
         with self._lock:
             return {
@@ -70,10 +83,12 @@ class Meter:
             }
 
 
-def record(model_id: str, input_tokens: int, output_tokens: int, cached_input_tokens: int = 0) -> None:
+def record(model_id: str, input_tokens: int, output_tokens: int, cached_input_tokens: int = 0,
+           cache_write_tokens: int = 0) -> None:
     """Add one call's usage to every meter open on this context. No-op when none is open."""
     for m in _active.get():
-        m.add(model_id, int(input_tokens or 0), int(output_tokens or 0), int(cached_input_tokens or 0))
+        m.add(model_id, int(input_tokens or 0), int(output_tokens or 0), int(cached_input_tokens or 0),
+              int(cache_write_tokens or 0))
 
 
 @contextmanager

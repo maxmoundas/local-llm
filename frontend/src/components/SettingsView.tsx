@@ -3,7 +3,7 @@ import { Row, Segmented, Toggle } from './controls'
 import UsageTab from './UsageTab'
 import { api } from '../api/client'
 import { getThemePref, setThemePref, type ThemePref } from '../lib/theme'
-import type { AppSettings } from '../types'
+import type { AppSettings, RestoreResult } from '../types'
 
 type Editable = Omit<AppSettings, 'models' | 'jev_configured' | 'default_system_prompt' | 'default_guardrail_prompt'
   | 'sandbox_active' | 'connectors' | 'transcription_available' | 'access_token_set'>
@@ -42,6 +42,10 @@ export default function SettingsView({ onDisplayName }: { onDisplayName: (name: 
   const [tab, setTab] = useState<Tab>('general')
   const [theme, setTheme] = useState<ThemePref>(getThemePref)
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved'>('idle')
+  const [restoreMode, setRestoreMode] = useState<'merge' | 'replace'>('merge')
+  const [restoring, setRestoring] = useState(false)
+  const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null)
+  const [restoreError, setRestoreError] = useState('')
 
   useEffect(() => {
     Promise.all([api.getSettings(), api.getMemory()]).then(([s, m]) => {
@@ -71,6 +75,22 @@ export default function SettingsView({ onDisplayName }: { onDisplayName: (name: 
     onDisplayName(updated.display_name ?? '')
     setSaveState('saved')
     setTimeout(() => setSaveState('idle'), 1800)
+  }
+
+  const restore = async (file: File | undefined) => {
+    if (!file) return
+    if (restoreMode === 'replace' && !window.confirm(
+      'Replace mode overwrites chats and projects that are in the backup, and replaces your memory, settings, and schedules. Continue?')) return
+    setRestoring(true)
+    setRestoreError('')
+    setRestoreResult(null)
+    try {
+      setRestoreResult(await api.restore(file, restoreMode))
+    } catch (e) {
+      setRestoreError(e instanceof Error ? e.message : 'Restore failed')
+    } finally {
+      setRestoring(false)
+    }
   }
 
   const addTopic = () => {
@@ -132,6 +152,35 @@ export default function SettingsView({ onDisplayName }: { onDisplayName: (name: 
                   : <>Only this computer can use the app. To allow other devices, set <code>ACCESS_TOKEN</code> in <code>backend/.env</code> and <code>server.host: 0.0.0.0</code> in <code>config.yaml</code>.</>}>
                   <span className={`status-pill ${settings.access_token_set ? 'on' : 'off'}`}>{settings.access_token_set ? 'Token required' : 'This computer only'}</span>
                 </Row>
+
+                <h2 className="settings-subhead">Backup</h2>
+                <Row name="Download a backup" hint="Chats with their files, projects, memory, settings, and scheduled tasks, as one zip. API keys and connectors are not included.">
+                  <a className="btn" href={api.backupUrl} download>Download</a>
+                </Row>
+                <Row name="Restore from a backup" hint={<>
+                  <b>Merge</b> adds chats and projects you don't have and keeps everything else. <b>Replace</b> lets the backup win where they overlap.
+                  {restoreResult && (
+                    <span className="restore-result">
+                      Restored {restoreResult.chats_restored} chat{restoreResult.chats_restored === 1 ? '' : 's'}
+                      {restoreResult.chats_skipped ? ` (${restoreResult.chats_skipped} already here)` : ''},
+                      {' '}{restoreResult.projects_restored} project{restoreResult.projects_restored === 1 ? '' : 's'}
+                      {restoreResult.memory_restored ? ', memory' : ''}{restoreResult.settings_restored ? ', settings' : ''}.
+                      {' '}<button className="link-btn" onClick={() => window.location.reload()}>Reload to see them</button>
+                    </span>
+                  )}
+                  {restoreError && <span className="restore-result error">{restoreError}</span>}
+                </>}>
+                  <select className="select" value={restoreMode} disabled={restoring}
+                          onChange={e => setRestoreMode(e.target.value as 'merge' | 'replace')}>
+                    <option value="merge">Merge</option>
+                    <option value="replace">Replace</option>
+                  </select>
+                  <label className={`btn${restoring ? ' disabled' : ''}`}>
+                    {restoring ? 'Restoring…' : 'Choose file…'}
+                    <input type="file" accept=".zip,application/zip" hidden disabled={restoring}
+                           onChange={e => { restore(e.target.files?.[0]); e.target.value = '' }} />
+                  </label>
+                </Row>
               </>)}
 
               {tab === 'usage' && (
@@ -188,6 +237,17 @@ export default function SettingsView({ onDisplayName }: { onDisplayName: (name: 
                 <Row name="Internet access for code" hint="Lets sandboxed code install packages and call APIs.">
                   <Toggle checked={draft.sandbox_network} disabled={draft.code_execution === 'off'}
                           onChange={v => set('sandbox_network', v)} />
+                </Row>
+                <Row name="Ask before sending data out" hint="Web pages and connected services can hide instructions for the assistant. Once a task has read any, ask before it runs code with internet access or uses a connector that can send or change things. Scheduled runs decline instead of asking.">
+                  <Toggle checked={draft.agent_guard_untrusted} disabled={!draft.agent_enabled}
+                          onChange={v => set('agent_guard_untrusted', v)} />
+                </Row>
+                <Row name="Keep files the agent creates" hint="Older task workspaces are deleted, and their download links stop working.">
+                  <select className="select" value={String(draft.workspace_retention_days ?? 0)}
+                          onChange={e => set('workspace_retention_days', Number(e.target.value))}>
+                    {[7, 30, 90, 365].map(n => <option key={n} value={String(n)}>{n} days</option>)}
+                    <option value="0">Forever</option>
+                  </select>
                 </Row>
 
                 <h2 className="settings-subhead">Connectors</h2>

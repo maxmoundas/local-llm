@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     usage      TEXT,
-    error      TEXT
+    error      TEXT,
+    kind       TEXT NOT NULL DEFAULT 'turn'  -- turn | memory | title | api (LLM spend outside a chat turn)
 );
 CREATE INDEX IF NOT EXISTS tasks_chat ON tasks(chat_id, created_at);
 CREATE TABLE IF NOT EXISTS events (
@@ -52,6 +53,10 @@ def _db() -> sqlite3.Connection:
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.executescript(_SCHEMA)
+        cols = {r["name"] for r in _conn.execute("PRAGMA table_info(tasks)")}
+        if "kind" not in cols:  # databases created before usage outside turns was recorded
+            _conn.execute("ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'turn'")
+            _conn.commit()
         _conn_path = DB_PATH
     return _conn
 
@@ -62,6 +67,26 @@ def create(task_id: str, chat_id: str | None, model_id: str | None) -> None:
         _db().execute("INSERT INTO tasks (id, chat_id, status, model_id, created_at, updated_at) VALUES (?,?,?,?,?,?)",
                       (task_id, chat_id, "running", model_id, now, now))
         _db().commit()
+
+
+def record_usage(chat_id: str | None, model_id: str | None, usage: dict, kind: str) -> str:
+    """Store LLM spend that happened outside a chat turn (memory extraction, titles, /v1 calls)
+    as a finished row, so the usage dashboard and the monthly limit count it."""
+    import uuid
+    row_id = f"{kind}-{uuid.uuid4().hex}"
+    now = time.time()
+    with _lock:
+        _db().execute("INSERT INTO tasks (id, chat_id, status, model_id, created_at, updated_at, usage, kind) "
+                      "VALUES (?,?,?,?,?,?,?,?)",
+                      (row_id, chat_id, "done", model_id, now, now, json.dumps(usage), kind))
+        _db().commit()
+    return row_id
+
+
+def task_ids_for_chat(chat_id: str) -> list[str]:
+    with _lock:
+        rows = _db().execute("SELECT id FROM tasks WHERE chat_id=? AND kind='turn'", (chat_id,)).fetchall()
+    return [r["id"] for r in rows]
 
 
 def set_status(task_id: str, status: str, error: str | None = None, usage: dict | None = None) -> None:
@@ -114,7 +139,7 @@ def mark_interrupted() -> list[str]:
 def usage_since(since: float) -> list[dict]:
     """Finished tasks created after `since` (epoch seconds) that recorded usage — for the usage dashboard."""
     with _lock:
-        rows = _db().execute("SELECT id, chat_id, model_id, created_at, usage FROM tasks "
+        rows = _db().execute("SELECT id, chat_id, model_id, created_at, usage, kind FROM tasks "
                              "WHERE created_at>=? AND usage IS NOT NULL ORDER BY created_at", (since,)).fetchall()
     return [_row(r) for r in rows]
 

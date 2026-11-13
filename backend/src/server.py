@@ -51,10 +51,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
-from src import attachments, chat_store, context, decision_service, memory_store, project_store, scheduler
-from src import settings_store, transcribe
+from src import attachments, backup, chat_store, context, decision_service, memory_store, project_store, scheduler
+from src import settings_store, transcribe, usage
 from src.agent.connectors import ConnectorHub
 from src.agent.router import ResearchRouter
 from src.agent.runner import TaskAgent
@@ -177,6 +178,8 @@ def _apply_settings(s: dict) -> None:
         budget_usd=float(s["task_budget_usd"]) if s.get("task_budget_usd") else None,
         max_seconds=float(s["task_max_minutes"]) * 60 if s.get("task_max_minutes") else None,
         agent_model_id=s.get("agent_model_id") or None,
+        guard_untrusted=bool(s.get("agent_guard_untrusted", True)),
+        workspace_retention_days=float(s.get("workspace_retention_days") or 0),
     )
     if s.get("agent_enabled", True) and _llm_service is not None:
         _router = ResearchRouter(_llm_service, _decision_svc, use_jev=bool(s.get("jev_routing", True)),
@@ -207,12 +210,46 @@ async def lifespan(app: FastAPI):
                 "on" if _agent else "off", _sandbox.name if _sandbox else "off")
     threading.Thread(target=_llm.load, daemon=True, name="model-loader").start()
     threading.Thread(target=_start_connectors, daemon=True, name="connectors-start").start()
+    threading.Thread(target=_housekeeping, daemon=True, name="housekeeping").start()
     global _scheduler
     _scheduler = scheduler.Scheduler(_start_scheduled_run)
     _scheduler.start()
     yield
     _scheduler.stop()
     _connectors.stop()
+
+
+_HOUSEKEEPING_INTERVAL_S = 6 * 3600
+
+
+def _housekeeping() -> None:
+    """Startup + periodic cleanup: containers a crashed backend left behind, and old agent workspaces."""
+    try:
+        chat_store.sync_search_index()
+    except Exception:
+        logger.exception("Search index sync failed")
+    if isinstance(_sandbox, sb.DockerSandbox):
+        sb.DockerSandbox.remove_stale()
+        _ = _sandbox.languages  # probe the image once now, not during the first task
+    while True:
+        try:
+            sb.sweep_workspaces(_task_limits.get("workspace_retention_days") or 0, keep=_tasks.active_ids())
+        except Exception:
+            logger.exception("Workspace cleanup failed")
+        time.sleep(_HOUSEKEEPING_INTERVAL_S)
+
+
+def _metered(kind: str, chat_id: str | None, model_id: str | None, fn, *args, **kwargs):
+    """Run an LLM call outside a chat turn and record what it cost (usage dashboard, monthly limit)."""
+    with usage.attach(()), usage.meter() as m:
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            if m.calls:
+                try:
+                    task_store.record_usage(chat_id, model_id, m.full_snapshot(), kind)
+                except Exception:
+                    logger.exception("Could not record %s usage", kind)
 
 
 def _start_connectors() -> None:
@@ -269,6 +306,11 @@ async def _security(request: Request, call_next):
             and request.method != "OPTIONS" and not _authorized(request):
         return JSONResponse({"detail": "Authentication required"}, status_code=401)
     return await call_next(request)
+
+
+@app.exception_handler(chat_store.InvalidChatId)
+async def _invalid_chat_id(request: Request, exc: chat_store.InvalidChatId) -> JSONResponse:
+    return JSONResponse({"detail": "Chat not found"}, status_code=404)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -480,6 +522,8 @@ async def api_delete_chat(chat_id: str) -> Response:
         raise HTTPException(404, "Chat not found")
     for t in task_store.for_chat(chat_id):
         _tasks.cancel(t["id"])
+    for task_id in task_store.task_ids_for_chat(chat_id):
+        sb.remove_workspace(task_id)
     task_store.delete_for_chat(chat_id)
     return Response(status_code=204)
 
@@ -511,6 +555,8 @@ class SettingsUpdate(BaseModel):
     task_max_minutes: float | None = Field(default=None, ge=0, le=240)
     code_execution: Literal["auto", "docker", "local", "off"] | None = None
     sandbox_network: bool | None = None
+    agent_guard_untrusted: bool | None = None
+    workspace_retention_days: float | None = Field(default=None, ge=0, le=3650)
     jev_enabled: bool | None = None
     jev_model: str | None = None
     jev_routing: bool | None = None
@@ -639,6 +685,7 @@ def _turn_deps(svc: LLMService, chat: dict | None = None, unattended: bool = Fal
         agent_model_id=_task_limits.get("agent_model_id"),
         budget_usd=_task_limits.get("budget_usd"),
         max_seconds=_task_limits.get("max_seconds"),
+        guard_untrusted=_task_limits.get("guard_untrusted", True),
         unattended=unattended,
         workspace_files=_workspace_files,
     )
@@ -663,11 +710,7 @@ def _start_turn(chat_id: str, model_id: str | None, unattended: bool = False, **
         registry.get_provider(model_id)  # validate model exists
     except KeyError:
         raise HTTPException(400, f"Unknown model: {model_id}")
-    if _monthly_budget is not None:
-        spent = _month_spend()
-        if spent >= _monthly_budget:
-            raise HTTPException(402, f"Monthly spending limit reached (${spent:.2f} of ${_monthly_budget:.2f}). "
-                                     "Raise it in Settings → Usage.")
+    _check_monthly_budget()
     deps = _turn_deps(svc, chat, unattended=unattended)
     content = turn_kwargs.pop("content", "")
     image_base64 = turn_kwargs.pop("image_base64", None)
@@ -768,7 +811,8 @@ async def api_generate_title(chat_id: str) -> dict:
     chat = chat_store.get_chat(chat_id)
     if chat is None:
         raise HTTPException(404, "Chat not found")
-    title = await run_in_threadpool(_require_service().generate_title_from_history, chat["messages"])
+    title = await run_in_threadpool(_metered, "title", chat_id, None,
+                                    _require_service().generate_title_from_history, chat["messages"])
     return chat_store.rename_chat(chat_id, title)
 
 
@@ -1002,7 +1046,7 @@ async def api_usage(days: int = 30) -> dict:
             bucket["cost_usd"] += cost
             bucket["input_tokens"] += int(u.get("input_tokens") or 0)
             bucket["output_tokens"] += int(u.get("output_tokens") or 0)
-            bucket["turns"] += 1
+            bucket["turns"] += 1 if t.get("kind", "turn") == "turn" else 0
         by_model = u.get("by_model") or ({t["model_id"]: u} if t.get("model_id") else {})
         for mid, mu in by_model.items():
             m = per_model.setdefault(mid, {"model_id": mid, "name": names.get(mid, mid), "cost_usd": 0.0,
@@ -1016,7 +1060,7 @@ async def api_usage(days: int = 30) -> dict:
                                       "name": chat_names.get(key, "Deleted chats") if key else "Deleted chats",
                                       "cost_usd": 0.0, "turns": 0})
         c["cost_usd"] += cost
-        c["turns"] += 1
+        c["turns"] += 1 if t.get("kind", "turn") == "turn" else 0
 
     def rounded(d: dict) -> dict:
         return {**d, "cost_usd": round(d["cost_usd"], 6)}
@@ -1029,6 +1073,50 @@ async def api_usage(days: int = 30) -> dict:
         "month_to_date_usd": round(month, 6),
         "monthly_budget_usd": _monthly_budget,
     }
+
+
+# ── Backup & restore (/api/backup, /api/restore) ───────────────────────
+
+MAX_RESTORE_BYTES = 4 * 1024**3
+
+
+@app.get("/api/backup")
+async def api_backup() -> Any:
+    """Download chats, projects, memory, settings, and schedules as one zip (no API keys)."""
+    path = await run_in_threadpool(backup.create_backup)
+    name = f"local-llm-backup-{datetime.now():%Y-%m-%d}.zip"
+    return FileResponse(path, filename=name, media_type="application/zip",
+                        background=BackgroundTask(path.unlink, missing_ok=True))
+
+
+@app.post("/api/restore")
+async def api_restore(request: Request, mode: Literal["merge", "replace"] = "merge") -> dict:
+    """Restore a backup zip sent as the raw request body. See src/backup.py for the merge/replace rules."""
+    import tempfile
+    fd, tmp_name = tempfile.mkstemp(prefix="local-llm-restore-", suffix=".zip")
+    tmp = Path(tmp_name)
+    try:
+        size = 0
+        with os.fdopen(fd, "wb") as f:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > MAX_RESTORE_BYTES:
+                    raise HTTPException(413, "Backup is too large")
+                f.write(chunk)
+        if size == 0:
+            raise HTTPException(400, "Send the backup zip as the request body")
+        if _tasks.active_ids():
+            raise HTTPException(409, "Wait for running chats to finish before restoring")
+        try:
+            result = await run_in_threadpool(backup.restore, tmp, mode)
+        except backup.BackupError as exc:
+            raise HTTPException(400, str(exc))
+        if result.get("settings_restored"):
+            _apply_settings(settings_store.load())
+        logger.info("Backup restored: %s", result)
+        return result
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 # ── Scheduled tasks (/api/schedules) ───────────────────────────────────
@@ -1161,7 +1249,13 @@ async def api_logout() -> Response:
 
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
-    content: str
+    # A string, or OpenAI content parts ([{"type": "text", "text": ...}, ...]) — text parts are joined.
+    content: str | list[dict] | None = ""
+
+    def text(self) -> str:
+        if isinstance(self.content, list):
+            return "\n".join(str(p.get("text", "")) for p in self.content if p.get("type") in ("text", "input_text"))
+        return self.content or ""
 
 
 class ChatCompletionRequest(BaseModel):
@@ -1227,15 +1321,46 @@ def vision_completion(req: VisionRequest) -> dict[str, str]:
 
 @app.get("/v1/models", response_model=OAIModelListResponse)
 async def list_models() -> OAIModelListResponse:
-    llm = _require_llm()
-    return OAIModelListResponse(data=[OAIModelInfo(id=llm.repo_id, created=int(time.time()))])
+    """Every model the app can use — the in-process one plus cloud and local-server models."""
+    created = int(time.time())
+    data: list[OAIModelInfo] = []
+    if _llm is not None and _llm.is_loaded:
+        data.append(OAIModelInfo(id=_llm.repo_id, created=created))
+    if _registry is not None:
+        for m in _registry.list_models():
+            if m.provider == "local":
+                continue  # the in-process model is listed above, by its repo id, once it has loaded
+            data.append(OAIModelInfo(id=m.id, created=created, owned_by=m.provider))
+    if not data:
+        raise HTTPException(503, "No models are ready yet — try again in a moment")
+    return OAIModelListResponse(data=data)
+
+
+def _is_local_target(model: str) -> bool:
+    """'local', an empty name, or the in-process model's repo id → the direct in-process path."""
+    if model in ("", "local"):
+        return True
+    if _llm is not None and model == _llm.repo_id:
+        return True
+    reg_model = _model_or_none(model)
+    return reg_model is not None and reg_model.provider == "local"
+
+
+def _check_monthly_budget() -> None:
+    if _monthly_budget is not None:
+        spent = _month_spend()
+        if spent >= _monthly_budget:
+            raise HTTPException(402, f"Monthly spending limit reached (${spent:.2f} of ${_monthly_budget:.2f}). "
+                                     "Raise it in Settings → Usage.")
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest) -> Any:
-    llm = _require_llm()
-    messages = [m.model_dump() for m in req.messages]
+    messages = [{"role": m.role, "content": m.text()} for m in req.messages]
+    if not _is_local_target(req.model):
+        return await _registry_completion(req, messages)
 
+    llm = _require_llm()
     if req.stream:
         return StreamingResponse(
             _sse_openai(req, messages, llm),
@@ -1268,6 +1393,111 @@ def _sse_openai(req: ChatCompletionRequest, messages: list[dict], llm: LocalLLM)
                  "choices": [{"index": 0, "delta": {"content": token}, "finish_reason": None}]}
         yield f"data: {json.dumps(chunk)}\n\n"
     yield "data: [DONE]\n\n"
+
+
+_STREAM_END = object()
+
+
+def _registry_stream(model_id: str, messages: list[dict], options: dict | None):
+    """Run a registry model's stream on its own thread (one meter, one thread) and yield its pieces.
+
+    Yields text chunks, then a final dict: {"usage": meter snapshot} or {"error": message}.
+    Usage is recorded as kind "api" so /v1 spend shows on the dashboard and counts toward the monthly limit.
+    """
+    import queue
+    q: queue.Queue = queue.Queue()
+    svc = _require_service()
+
+    def work() -> None:
+        with usage.attach(()), usage.meter() as m:
+            try:
+                for chunk in svc.stream(messages, model_id, call_type="api", options=options):
+                    q.put(chunk)
+            except Exception as exc:
+                q.put({"error": str(exc)})
+        if m.calls:
+            try:
+                task_store.record_usage(None, model_id, m.full_snapshot(), "api")
+            except Exception:
+                logger.exception("Could not record /v1 usage")
+        q.put({"usage": m.snapshot()})
+        q.put(_STREAM_END)
+
+    threading.Thread(target=work, daemon=True, name="v1-stream").start()
+    while (item := q.get()) is not _STREAM_END:
+        yield item
+
+
+async def _registry_completion(req: ChatCompletionRequest, messages: list[dict]) -> Any:
+    model = _model_or_none(req.model)
+    if model is None:
+        raise HTTPException(404, f"Unknown model: {req.model}. GET /v1/models lists the available ones.")
+    _check_monthly_budget()
+    options = {"temperature": req.temperature} if req.temperature is not None and model.temperature else None
+    cid, created = f"chatcmpl-{uuid.uuid4().hex[:8]}", int(time.time())
+
+    if req.stream:
+        def sse():
+            for item in _registry_stream(model.id, messages, options):
+                if isinstance(item, str):
+                    delta = {"content": item}
+                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model.id,
+                             "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+                elif "error" in item:
+                    chunk = {"error": {"message": item["error"], "type": "provider_error"}}
+                else:
+                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model.id,
+                             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                yield f"data: {json.dumps(chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(sse(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
+
+    def collect() -> tuple[str, dict]:
+        text, info = [], {}
+        for item in _registry_stream(model.id, messages, options):
+            if isinstance(item, str):
+                text.append(item)
+            else:
+                info.update(item)
+        return "".join(text), info
+
+    text, info = await run_in_threadpool(collect)
+    if "error" in info:
+        raise HTTPException(502, info["error"])
+    u = info.get("usage") or {}
+    prompt_tokens, completion_tokens = int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0)
+    return ChatCompletionResponse(
+        id=cid, created=created, model=model.id,
+        choices=[Choice(index=0, message=ChatMessage(role="assistant", content=text))],
+        usage=Usage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens),
+    )
+
+
+# ── Built frontend (single-process mode) ────────────────────────────────
+# After `npm run build` in frontend/, the backend serves the app itself at http://<host>:8000 — no Vite
+# dev server needed (e.g. to use it from a phone with ACCESS_TOKEN set). Unknown paths fall back to
+# index.html so client-side routes work. Override the folder with server.frontend_dist in config.yaml.
+
+_FRONTEND_DIST = Path(_SERVER_CFG.get("frontend_dist") or Path(__file__).resolve().parents[2] / "frontend" / "dist")
+
+
+@app.get("/{path:path}", include_in_schema=False)
+async def frontend(path: str) -> Any:
+    if path.startswith(("api/", "v1/")) or path in ("api", "v1"):
+        raise HTTPException(404, "Not found")
+    index = _FRONTEND_DIST / "index.html"
+    if not index.is_file():
+        raise HTTPException(404, "Frontend not built. Run `npm run build` in frontend/, or use the dev server "
+                                 "at http://localhost:5173.")
+    root = _FRONTEND_DIST.resolve()
+    target = (root / path).resolve()
+    if path and target.is_file() and root in target.parents:
+        # Vite fingerprints asset names, so they can be cached forever; index.html must not be.
+        cache = "public, max-age=31536000, immutable" if "assets" in target.relative_to(root).parts else "no-cache"
+        return FileResponse(target, headers={"Cache-Control": cache})
+    return FileResponse(index, headers={"Cache-Control": "no-cache"})
 
 
 # ── Entry point ────────────────────────────────────────────────────────

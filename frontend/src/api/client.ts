@@ -1,6 +1,6 @@
 import type {
   AppSettings, Attachment, Chat, ChatDetail, ChatSettings, HealthStatus, InputRequest, MemoryData, ModelOption,
-  PendingFile, Project, ProjectDetail, Schedule, SearchResult, UsageReport,
+  PendingFile, Project, ProjectDetail, RestoreResult, Schedule, SearchResult, UsageReport,
 } from '../types'
 
 // All paths are relative — Vite proxies /api/* and /health to :8000 in dev.
@@ -58,6 +58,11 @@ export const api = {
   deleteChat: (id: string): Promise<void> => req(`/api/chats/${id}`, { method: 'DELETE' }),
   pinChat: (id: string): Promise<{ pinned: boolean }> => req(`/api/chats/${id}/pin`, { method: 'POST' }),
   generateTitle: (id: string): Promise<ChatDetail> => req(`/api/chats/${id}/title`, { method: 'POST' }),
+
+  // ── backup ──
+  backupUrl: '/api/backup',
+  restore: (file: File, mode: 'merge' | 'replace'): Promise<RestoreResult> =>
+    req(`/api/restore?mode=${mode}`, { method: 'POST', headers: { 'Content-Type': 'application/zip' }, body: file }),
   switchVersion: (id: string, index: number, version: number): Promise<ChatDetail> =>
     req(`/api/chats/${id}/versions`, json('POST', { index, version })),
   exportUrl: (id: string, format: 'md' | 'json'): string => `/api/chats/${id}/export?format=${format}`,

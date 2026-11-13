@@ -132,6 +132,12 @@ class RunControls:
     budget_usd: float | None = None
     deadline: float | None = None  # time.monotonic() value
     meter: usage.Meter | None = None
+    # Ask before egress tools (code with network, connector writes) once untrusted content was read.
+    guard_untrusted: bool = False
+
+
+UNTRUSTED_REASON = ("This task has read content from the web or a connected service, which could contain "
+                    "instructions to send your data elsewhere. This step can reach the network, so check it first.")
 
 
 def build_answer_system(base_system: str, notes: str, stopped: str = "") -> str:
@@ -169,6 +175,7 @@ class TaskAgent:
         actions: list[dict] = []
         sources: dict[str, Source] = {}
         seen_calls: set[str] = set()
+        tainted = False  # has this task read content written by someone else (web, email…)?
         failed_steps = 0
         stopped = ""
         log_budget = self._log_budget(model_id)
@@ -208,7 +215,7 @@ class TaskAgent:
             seen_calls.update(_call_key(c) for c in calls)
 
             step_failed = True
-            for action, call, result in self._run_calls(calls, tools, ctl):
+            for action, call, result in self._run_calls(calls, tools, ctl, tainted):
                 _replace(actions, action)
                 yield AgentEvent("action", action=dict(action))
                 if action["status"] in ("waiting", "running"):
@@ -218,6 +225,8 @@ class TaskAgent:
                     continue
                 if action["status"] == "done":
                     step_failed = False
+                if tools[call.name].untrusted:
+                    tainted = True
                 log.append({"label": action["label"], "text": result.text[:_RESULT_CHAR_LIMIT]})
                 for s in result.sources:
                     if s.url and s.url not in sources:
@@ -297,9 +306,13 @@ class TaskAgent:
         log.append({"label": f"Asked the user: {q}",
                     "text": answer or "(no answer — proceed with your best judgement)"})
 
-    def _run_calls(self, calls: list[ToolCall], tools: dict[str, Tool], ctl: RunControls
+    def _run_calls(self, calls: list[ToolCall], tools: dict[str, Tool], ctl: RunControls, tainted: bool = False
                    ) -> Iterator[tuple[dict, ToolCall, ToolResult | None]]:
         """Announce each call, get approval where a tool needs it, then run approved calls in parallel.
+
+        Approval is needed for tools marked `confirm`, and — with the untrusted-content guard on —
+        for `egress` tools once the task has read untrusted content (`tainted`), since that content
+        could have told the model to send your data somewhere.
 
         Yields (action, call, result): first an announcement per call (status "waiting" or
         "running", result None), "denied" for declined calls, then each finished call.
@@ -310,12 +323,17 @@ class TaskAgent:
             args = {k: v for k, v in raw.arguments.items() if k != "status"}
             status_line = str(raw.arguments.get("status") or "").strip()[:120]
             call = ToolCall(raw.name, args, raw.id)
+            guarded = not tool.confirm and ctl.guard_untrusted and tainted and tool.egress
+            needs_ok = tool.confirm or guarded
             action = _new_action(call.name, tool.kind, status_line or _safe(tool.running, args, tool.name),
-                                 status="waiting" if tool.confirm else "running")
+                                 status="waiting" if needs_ok else "running")
             yield dict(action), call, None
-            if tool.confirm:
-                reply = ctl.ask({"kind": "approval", "action_id": action["id"], "tool": call.name,
-                                 "label": action["label"], "arguments": args}) if ctl.ask else None
+            if needs_ok:
+                request = {"kind": "approval", "action_id": action["id"], "tool": call.name,
+                           "label": action["label"], "arguments": args}
+                if guarded:
+                    request["reason"] = UNTRUSTED_REASON
+                reply = ctl.ask(request) if ctl.ask else None
                 if not (reply or {}).get("approved"):
                     action.update(status="denied", summary="not approved", ended=_now_ms())
                     yield action, call, None

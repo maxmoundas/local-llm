@@ -60,3 +60,6 @@ Thumbs.db
 # Personal runtime data (created on first use; defaults live in settings_store.py)
 backend/memory.txt
 backend/settings.json
+
+# TypeScript incremental build cache
+*.tsbuildinfo

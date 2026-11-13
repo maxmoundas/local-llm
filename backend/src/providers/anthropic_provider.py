@@ -161,7 +161,8 @@ def _record(model_id: str, response) -> None:
         v = getattr(u, name, 0)
         return v if isinstance(v, int) else 0
     cached = n("cache_read_input_tokens")
-    usage.record(model_id, n("input_tokens") + cached + n("cache_creation_input_tokens"), n("output_tokens"), cached)
+    written = n("cache_creation_input_tokens")
+    usage.record(model_id, n("input_tokens") + cached + written, n("output_tokens"), cached, written)
 
 
 def _check_refusal(response) -> None:

@@ -110,11 +110,22 @@ class TestResearchPath:
         assert not any(e["type"] == "action" for e in events)
         server._agent.run.assert_not_called()
 
-    def test_images_skip_research(self, test_client):
+    def test_images_can_research(self, test_client):
+        """Images no longer skip the agent: the router sees them named, the planner is told it can't see them."""
         from src import server
         server._router, server._agent = _research_stubs()
         _send(test_client, image_base64="aGVsbG8=")
-        server._router.decide.assert_not_called()
+        route_text = server._router.decide.call_args[0][0]
+        assert "Attached images" in route_text and "image.png" in route_text
+        planner_text = server._agent.run.call_args[0][1]
+        assert "can't" in planner_text and "image.png" in planner_text
+
+    def test_images_without_research_answer_directly(self, test_client):
+        from src import server
+        server._router, server._agent = _research_stubs(research=False)
+        _, events = _send(test_client, image_base64="aGVsbG8=")
+        server._agent.run.assert_not_called()
+        assert not any(e["type"] == "action" for e in events)
 
     def test_disabled_agent_answers_directly(self, test_client):
         from src import server

@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from src import attachments as att
-from src import chat_store
+from src import chat_store, usage
 from src.agent.connectors import ConnectorHub
 from src.agent.router import ResearchRouter
 from src.agent.runner import RunControls, TaskAgent, build_answer_system
@@ -35,6 +35,7 @@ from src.guardrail_service import SUPPORT_SYSTEM_NOTE, GuardrailService
 from src.llm_service import CALL_TYPE_CHAT, LLMService
 from src.logger import get_logger
 from src.providers.base import RefusalError
+from src.tasks import store as task_store
 from src.tasks.manager import Cancelled, TaskContext
 
 _log = get_logger(__name__)
@@ -58,6 +59,8 @@ class TurnDeps:
     agent_model_id: str | None = None   # model for agent steps; None → the chat model
     budget_usd: float | None = None
     max_seconds: float | None = None
+    # Ask before code with network access / connector writes once the task has read web or connector content.
+    guard_untrusted: bool = True
     # Scheduled runs: nobody is watching, so questions go unanswered and approvals are denied.
     unattended: bool = False
     # chat → files the agent can work on (copied into its workspace): (display name, path on disk).
@@ -123,25 +126,33 @@ def _run_turn(ctx: TaskContext, chat_id: str, content: str, image_base64: str | 
 
     if deps.update_memory is not None and mode != "regenerate":
         prev = next((m.get("content") or "" for m in reversed(chat["messages"][:-1]) if m["role"] == "assistant"), "")
-        memory_job = _MemoryJob(deps.update_memory, content, prev)
+        memory_job = _MemoryJob(deps.update_memory, content, prev, chat_id)
     else:
         memory_job = None
 
     extra: dict = {"task_id": ctx.task_id, "model_id": model_id}
     started = time.time()
-    has_images = any(a.get("kind") == "image" for a in attachments)
+    images = [a for a in attachments if a.get("kind") == "image"]
 
-    # Agent — the router decides per message; images skip it (tools can't see them).
-    if deps.router is not None and deps.agent is not None and not has_images:
+    # Agent — the router decides per message. The planner can't see images, but they're staged in the
+    # workspace for code, and the final answer (a vision model) still sees them alongside the notes.
+    if deps.router is not None and deps.agent is not None:
         ctx.emit("status", text="Thinking")
         docs = [a for a in attachments if a.get("kind") == "document"]
         route_text = content + (f"\n\n[Attached and already readable: {', '.join(d['name'] for d in docs)}]" if docs else "")
+        if images:
+            route_text += f"\n\n[Attached images, visible to the answering model: {', '.join(i['name'] for i in images)}]"
         if deps.router.decide(route_text, chat["messages"]).research:
+            planner_text = _with_documents(chat, content, docs)
+            if images:
+                planner_text += (f"\n\n(The user attached image(s): {', '.join(i['name'] for i in images)}. You can't "
+                                 "see them, but the model writing the final answer can — gather only what the "
+                                 "images can't tell. They're also in the workspace if code needs to process them.)")
             try:
                 # The first planner turn must call a tool: weaker models otherwise talk themselves out
                 # of acting. An occasional false-positive route costs one cheap lookup; a missed one
                 # costs a wrong answer.
-                notes, stopped = _run_agent(ctx, chat, _with_documents(chat, content, docs), model_id, deps, extra)
+                notes, stopped = _run_agent(ctx, chat, planner_text, model_id, deps, extra)
             except Cancelled:
                 notes, stopped = "", "cancelled"
             if ctx.cancelled:
@@ -227,18 +238,30 @@ _MEMORY_WAIT_S = 8.0
 
 
 class _MemoryJob:
-    """Runs the memory updater on a daemon thread and keeps its result."""
+    """Runs the memory updater on a daemon thread and keeps its result.
 
-    def __init__(self, fn: Callable[[str, str], dict | None], content: str, prev: str) -> None:
+    It can outlive the turn (the turn waits only briefly), so it meters its own LLM calls and
+    records them as separate "memory" usage instead of adding to the turn's meter.
+    """
+
+    def __init__(self, fn: Callable[[str, str], dict | None], content: str, prev: str,
+                 chat_id: str | None = None) -> None:
         self._result: dict | None = None
+        self._chat_id = chat_id
         self._thread = threading.Thread(target=self._run, args=(fn, content, prev), daemon=True, name="memory-update")
         self._thread.start()
 
     def _run(self, fn: Callable[[str, str], dict | None], content: str, prev: str) -> None:
-        try:
-            self._result = fn(content, prev)
-        except Exception:
-            _log.exception("Memory update failed")
+        with usage.attach(()), usage.meter() as m:  # never count toward the turn's own meter
+            try:
+                self._result = fn(content, prev)
+            except Exception:
+                _log.exception("Memory update failed")
+        if m.calls:
+            try:
+                task_store.record_usage(self._chat_id, None, m.full_snapshot(), "memory")
+            except Exception:
+                _log.exception("Could not record memory usage")
 
     def wait(self, timeout: float) -> dict | None:
         self._thread.join(timeout)
@@ -268,6 +291,7 @@ def _run_agent(ctx: TaskContext, chat: dict, content: str, model_id: str, deps: 
         budget_usd=deps.budget_usd,
         deadline=time.monotonic() + deps.max_seconds if deps.max_seconds else None,
         meter=ctx.meter,
+        guard_untrusted=deps.guard_untrusted,
     )
     notes, stopped = "", ""
     actions: list[dict] = []

@@ -175,6 +175,8 @@ class ConnectorHub:
             raw_schema = _field(t, "input_schema", "inputSchema")
             schema = raw_schema if isinstance(raw_schema, dict) else {"type": "object", "properties": {}}
             schema = {"type": "object", "properties": {}, **schema}
+            annotations = getattr(t, "annotations", None)
+            read_only_hint = bool(getattr(annotations, "readOnlyHint", False)) if annotations else False
             self._tools.append(Tool(
                 name=_tool_name(server, t.name),
                 description=f"[{server}] {t.description or title}"[:1024],
@@ -185,6 +187,10 @@ class ConnectorHub:
                 kind="connector",
                 confirm=any(fnmatch.fnmatch(t.name, p) for p in confirm_patterns),
                 read_only=False,
+                # Results (email bodies, issues, files…) are written by other people; anything not
+                # declared read-only by its server may send data out.
+                untrusted=True,
+                egress=not read_only_hint,
             ))
 
     def _caller(self, server: str, tool: str):

@@ -38,12 +38,13 @@ def _first_line(code: str) -> str:
 
 def workspace_tools(sandbox: Sandbox, task_id: str, timeout: int = 120) -> list[Tool]:
     ws = (sb.WORKSPACES_DIR / task_id).resolve()  # created on first write
+    languages = [lang for lang in sandbox.languages if lang in LANGUAGES] or ["python"]
 
     def run_code(a: dict) -> ToolResult:
         language = a.get("language", "python")
-        if language not in LANGUAGES:
-            return ToolResult(text=f"Unsupported language {language!r}. Use one of: {', '.join(LANGUAGES)}",
-                              summary="unsupported")
+        if language not in languages:
+            return ToolResult(text=f"Unsupported language {language!r}. Use one of: {', '.join(languages)}",
+                              summary="unsupported", ok=False)
         before = {f["path"]: f["size"] for f in list_workspace(ws)}
         result = sandbox.run(task_id, language, str(a.get("code", "")), timeout=min(int(a.get("timeout") or timeout), 600))
         after = list_workspace(ws)
@@ -76,7 +77,8 @@ def workspace_tools(sandbox: Sandbox, task_id: str, timeout: int = 120) -> list[
         return ToolResult(text="\n".join(f"{f['path']} ({f['size']} bytes)" for f in files),
                           summary=f"{len(files)} file{'s' if len(files) != 1 else ''}")
 
-    net = "with" if getattr(sandbox, "network", False) else "without"
+    egress = bool(getattr(sandbox, "network", False))
+    net = "with" if egress else "without"
     return [
         Tool(
             name="run_code",
@@ -88,13 +90,13 @@ def workspace_tools(sandbox: Sandbox, task_id: str, timeout: int = 120) -> list[
                 "or in bash when internet is available."
             ),
             parameters={"type": "object", "properties": {
-                "language": {"type": "string", "enum": list(LANGUAGES), "description": "Default python"},
+                "language": {"type": "string", "enum": languages, "description": "Default python"},
                 "code": {"type": "string", "description": "Complete program to run"},
             }, "required": ["code"]},
             run=run_code,
             running=lambda a: f"Running code{': ' + _first_line(a.get('code', '')) if _first_line(a.get('code', '')) else ''}",
             done=lambda a: "Ran code",
-            kind="code", read_only=False,
+            kind="code", read_only=False, egress=egress,
         ),
         Tool(
             name="write_file",

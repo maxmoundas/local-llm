@@ -152,6 +152,11 @@ class TaskManager:
             live.finished_at = time.monotonic()
             self._emit(live, TERMINAL, {"status": status})
 
+    def active_ids(self) -> set[str]:
+        """Ids of tasks still running in this process."""
+        with self._lock:
+            return {t for t, live in self._live.items() if live.finished_at is None}
+
     def cancel(self, task_id: str) -> bool:
         live = self._live.get(task_id)
         if not live or live.finished_at is not None:

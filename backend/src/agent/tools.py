@@ -56,6 +56,10 @@ class Tool:
     kind: str = "search"      # icon family in the UI: search | news | page | weather | code | file | connector
     confirm: bool = False     # pause for the user's approval before running (side effects: sending, deleting…)
     read_only: bool = True    # only gathers information (lets the sufficiency check end research early)
+    # Prompt-injection guard: `untrusted` results come from outside (web pages, email…) and may hold
+    # instructions; once a task has read any, `egress` tools (can send data out) need the user's approval.
+    untrusted: bool = False
+    egress: bool = False
 
     @property
     def spec(self) -> dict:
@@ -265,6 +269,7 @@ def default_tools() -> list[Tool]:
             run=_web_search,
             running=lambda a: f"Searching the web for {_quote(a.get('query', ''))}",
             done=lambda a: f"Searched the web for {_quote(a.get('query', ''))}",
+            untrusted=True,
         ),
         Tool(
             name="news_search",
@@ -276,7 +281,7 @@ def default_tools() -> list[Tool]:
             run=_news_search,
             running=lambda a: f"Searching news for {_quote(a.get('query', ''))}",
             done=lambda a: f"Searched news for {_quote(a.get('query', ''))}",
-            kind="news",
+            kind="news", untrusted=True,
         ),
         Tool(
             name="fetch_page",
@@ -286,7 +291,7 @@ def default_tools() -> list[Tool]:
             run=_fetch_page,
             running=lambda a: f"Reading {_domain(str(a.get('url', '')))}",
             done=lambda a: f"Read {_domain(str(a.get('url', '')))}",
-            kind="page",
+            kind="page", untrusted=True,
         ),
         Tool(
             name="get_weather",

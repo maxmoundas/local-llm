@@ -71,6 +71,7 @@ export interface InputRequest {
   label?: string
   arguments?: Record<string, unknown>
   action_id?: string
+  reason?: string   // why approval is needed when the tool itself doesn't require it
 }
 
 /** Facts the memory system added or removed because of one message. */
@@ -216,6 +217,8 @@ export interface AppSettings {
   task_max_minutes: number | null
   code_execution: 'auto' | 'docker' | 'local' | 'off'
   sandbox_network: boolean
+  agent_guard_untrusted: boolean   // ask before code/connectors send data out after reading web content
+  workspace_retention_days: number  // delete agent workspaces older than this (0 = keep)
   sandbox_active: string
   connectors: Record<string, string>
   jev_enabled: boolean
@@ -230,6 +233,17 @@ export interface AppSettings {
   transcription_available: boolean
   access_token_set: boolean
   models: ModelOption[]
+}
+
+export interface RestoreResult {
+  mode: 'merge' | 'replace'
+  chats_restored: number
+  chats_skipped: number
+  projects_restored: number
+  projects_skipped: number
+  memory_restored?: boolean
+  settings_restored?: boolean
+  schedules_restored?: number
 }
 
 export interface MemoryData {

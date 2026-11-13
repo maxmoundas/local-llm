@@ -17,6 +17,18 @@ if [ -z "$PYTHON" ]; then
   exit 1
 fi
 
+# --prod: build the frontend once and let the backend serve it (one process, http://localhost:8000).
+if [ "${1:-}" = "--prod" ]; then
+  echo "Building frontend..."
+  (cd "$SCRIPT_DIR/frontend" && npm run build)
+  echo "Starting backend (serving the built app)..."
+  cd "$SCRIPT_DIR/backend"
+  echo ""
+  echo "App: http://localhost:8000"
+  echo ""
+  exec "$PYTHON" serve.py
+fi
+
 echo "Starting backend..."
 cd "$SCRIPT_DIR/backend"
 "$PYTHON" serve.py &

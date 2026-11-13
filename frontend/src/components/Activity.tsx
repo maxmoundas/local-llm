@@ -184,6 +184,7 @@ function InputCard({ request, onReply }: {
       <div className="input-card">
         <div className="input-card-title"><HandIcon size={15} /> Allow this action?</div>
         <div className="input-card-text">{request.label ?? request.tool}</div>
+        {request.reason && <div className="input-card-reason">{request.reason}</div>}
         {args && args !== '{}' && <pre className="input-card-args">{args}</pre>}
         <div className="input-card-actions">
           <button className="btn" disabled={sent} onClick={() => reply({ approved: false })}>Deny</button>

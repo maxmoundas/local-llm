@@ -10,6 +10,9 @@ Each task gets a workspace directory (data/workspaces/<task_id>). Code runs in:
                   limits. NOT isolation — model-written code can read your files. Opt-in only.
 
 `detect_sandbox()` picks Docker when the daemon answers, else nothing (code tools are not offered).
+
+Housekeeping: `remove_workspace()` when a chat is deleted, `sweep_workspaces()` for old ones, and
+`DockerSandbox.remove_stale()` at startup for containers a crashed backend left running.
 """
 from __future__ import annotations
 
@@ -18,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,6 +65,34 @@ def workspace_for(task_id: str) -> Path:
     return path
 
 
+def remove_workspace(task_id: str) -> None:
+    """Delete one task's workspace (its files and anything code wrote there)."""
+    if not task_id or "/" in task_id or "\\" in task_id or task_id.startswith("."):
+        return
+    shutil.rmtree(WORKSPACES_DIR / task_id, ignore_errors=True)
+
+
+def sweep_workspaces(max_age_days: float, keep: set[str] | frozenset[str] = frozenset()) -> int:
+    """Delete workspaces untouched for `max_age_days` (except ids in `keep`). Returns how many went."""
+    if not max_age_days or max_age_days <= 0 or not WORKSPACES_DIR.is_dir():
+        return 0
+    cutoff = time.time() - max_age_days * 86400
+    removed = 0
+    for d in WORKSPACES_DIR.iterdir():
+        if not d.is_dir() or d.name in keep:
+            continue
+        try:
+            newest = max((p.stat().st_mtime for p in d.rglob("*")), default=d.stat().st_mtime)
+        except OSError:
+            continue
+        if newest < cutoff:
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 1
+    if removed:
+        _log.info("Removed %d agent workspace(s) older than %g days", removed, max_age_days)
+    return removed
+
+
 def safe_path(workspace: Path, relative: str) -> Path:
     """Resolve a model-supplied path inside the workspace, refusing escapes."""
     rel = str(relative or "").lstrip("/").removeprefix("workspace/")
@@ -72,6 +104,12 @@ def safe_path(workspace: Path, relative: str) -> Path:
 
 class Sandbox:
     name = "none"
+    network = False
+
+    @property
+    def languages(self) -> list[str]:
+        """Languages this sandbox can actually run (offered to the model as run_code's enum)."""
+        return list(LANGUAGES)
 
     def run(self, task_id: str, language: str, code: str, timeout: int = 60) -> RunResult:
         raise NotImplementedError
@@ -92,6 +130,37 @@ class DockerSandbox(Sandbox):
         self._containers: dict[str, str] = {}
         self._lock = threading.Lock()
         self._image_ready = False
+        self._languages: list[str] | None = None
+
+    @property
+    def languages(self) -> list[str]:
+        """python and bash always; javascript only if the image has node (python:*-slim doesn't)."""
+        if self._languages is None:
+            langs = ["python", "bash"]
+            try:
+                self._ensure_image()
+                probe = subprocess.run(["docker", "run", "--rm", "--network", "none", "--entrypoint", "sh",
+                                        self.image, "-c", "command -v node"], capture_output=True, timeout=60)
+                if probe.returncode == 0:
+                    langs.append("javascript")
+            except Exception as exc:
+                _log.warning("Could not probe sandbox image for node: %s", exc)
+            self._languages = langs
+        return self._languages
+
+    @staticmethod
+    def remove_stale() -> int:
+        """Remove task containers left running by a previous backend process (crash, kill -9)."""
+        try:
+            out = subprocess.run(["docker", "ps", "-aq", "--filter", "name=^llm-task-"],
+                                 capture_output=True, text=True, timeout=30).stdout.split()
+            if out:
+                subprocess.run(["docker", "rm", "-f", *out], capture_output=True, timeout=120)
+                _log.info("Removed %d stale sandbox container(s)", len(out))
+            return len(out)
+        except Exception as exc:
+            _log.warning("Could not clean up stale sandbox containers: %s", exc)
+            return 0
 
     def _ensure_image(self) -> None:
         if self._image_ready:
@@ -157,6 +226,12 @@ class DockerSandbox(Sandbox):
 class LocalSandbox(Sandbox):
     """Runs code as a plain subprocess. Not isolated — only enable when you accept that risk."""
     name = "local"
+
+    network = True  # a plain subprocess has whatever network access this machine has
+
+    @property
+    def languages(self) -> list[str]:
+        return [lang for lang, (_, interp) in LANGUAGES.items() if lang == "python" or shutil.which(interp[0])]
 
     def run(self, task_id: str, language: str, code: str, timeout: int = 60) -> RunResult:
         filename, interpreter = LANGUAGES[language]

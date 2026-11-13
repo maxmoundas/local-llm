@@ -444,6 +444,10 @@ body {
 .input-card-title { display: flex; align-items: center; gap: 8px; font-weight: 500; color: var(--text); }
 .input-card-title svg { color: var(--accent); flex-shrink: 0; }
 .input-card-text { color: var(--text-2); }
+.input-card-reason { color: var(--text-3); font-size: 13px; line-height: 1.45; }
+.btn.disabled { opacity: .5; pointer-events: none; }
+.restore-result { display: block; margin-top: 6px; color: var(--text-2); font-size: 13px; }
+.restore-result.error { color: var(--danger, #c0392b); }
 .input-card-args {
   max-height: 180px; overflow: auto; padding: 8px 10px; border-radius: 8px;
   background: var(--code-bg); font-family: var(--mono); font-size: 12px; color: var(--text-2);

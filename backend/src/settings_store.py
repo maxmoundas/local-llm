@@ -51,6 +51,10 @@ _DEFAULTS: dict = {
     "task_max_minutes": 20,     # wall-clock limit for the tool loop (0/None = no limit)
     "code_execution": "auto",   # auto (Docker if available) | docker | local (unsandboxed!) | off
     "sandbox_network": True,    # let sandboxed code reach the internet (pip install, APIs)
+    # Prompt-injection guard: once a task has read web pages or connector data, ask before running code
+    # that can reach the network or connector tools that can send data (scheduled runs: declined).
+    "agent_guard_untrusted": True,
+    "workspace_retention_days": 30,  # delete agent workspaces (code output files) older than this (0 = keep)
     # Jev (TypeSafe System One) — fast structured decisions. Each use can be turned off;
     # when off (or Jev is unreachable) that feature falls back to the cheapest LLM.
     "jev_enabled": True,
