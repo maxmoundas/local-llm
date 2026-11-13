@@ -111,10 +111,19 @@ def mark_interrupted() -> list[str]:
     return ids
 
 
+def usage_since(since: float) -> list[dict]:
+    """Finished tasks created after `since` (epoch seconds) that recorded usage — for the usage dashboard."""
+    with _lock:
+        rows = _db().execute("SELECT id, chat_id, model_id, created_at, usage FROM tasks "
+                             "WHERE created_at>=? AND usage IS NOT NULL ORDER BY created_at", (since,)).fetchall()
+    return [_row(r) for r in rows]
+
+
 def delete_for_chat(chat_id: str) -> None:
+    """Forget a deleted chat's activity. Task rows stay (detached) so past spending still counts."""
     with _lock:
         _db().execute("DELETE FROM events WHERE task_id IN (SELECT id FROM tasks WHERE chat_id=?)", (chat_id,))
-        _db().execute("DELETE FROM tasks WHERE chat_id=?", (chat_id,))
+        _db().execute("UPDATE tasks SET chat_id=NULL WHERE chat_id=?", (chat_id,))
         _db().commit()
 
 

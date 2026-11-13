@@ -60,6 +60,10 @@ _DEFAULTS: dict = {
     "jev_memory": True,         # skip memory extraction on messages with nothing to remember
     # Display name used in the greeting on the new-chat screen
     "display_name": "",
+    # Stop starting new turns once this calendar month's API spend reaches this many dollars (None = no limit)
+    "monthly_budget_usd": None,
+    # faster-whisper model for voice input: tiny | base | small | medium | large-v3
+    "whisper_model": "base",
 }
 
 

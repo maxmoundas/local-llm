@@ -11,6 +11,7 @@ Adding a new call type (tool execution, guardrail check, web-search summary…):
 """
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Iterator
 
@@ -30,6 +31,56 @@ CALL_TYPE_GUARD  = "guardrail_check"  # content safety classification
 CALL_TYPE_AGENT  = "agent_step"       # one tool-selection turn in the research loop
 CALL_TYPE_ROUTE  = "research_routing" # LLM fallback when Jev is unavailable
 CALL_TYPE_COMPACT = "agent_compaction" # summarizing old work-log entries in long tasks
+CALL_TYPE_HISTORY = "history_summary"  # summarizing old chat turns that no longer fit the context window
+
+
+_MEMORY_MSG_CHARS = 2000
+_MEMORY_MAX_FACTS = 20
+_NO_CHANGE = "NO_CHANGE"
+_FORGET_RE = re.compile(r"\b(forget|remove|delete|erase|clear|wipe|don'?t remember|stop remembering)\b", re.I)
+
+_MEMORY_SYSTEM = f"""You maintain a short profile of durable facts about the user, used to personalize future chats.
+
+Capture: name, profession, location, languages/tools/stack, ongoing projects, stated preferences \
+(e.g. answer style, units), recurring constraints.
+Skip: questions, task instructions, one-off or temporary details, anything about third parties, \
+secrets (passwords, keys, account numbers), and sensitive details (health, finances, etc.) unless \
+the user explicitly asks you to remember them.
+
+Rules:
+- If the user explicitly asks to remember something, add it. If they ask to forget something or \
+correct a fact, remove or fix it.
+- If nothing should change, reply with exactly: {_NO_CHANGE}
+- Otherwise reply with the COMPLETE updated profile: one "- " bullet per fact, under 15 words each, \
+at most {_MEMORY_MAX_FACTS} bullets. Keep every existing fact that is still true; merge duplicates; \
+replace facts the new message makes outdated.
+- No headers, preamble, or commentary."""
+
+
+def _parse_memory_reply(raw: str, current: str, user_message: str) -> str | None:
+    """Validate the memory model's reply; return new memory text or None to keep the current one."""
+    text = (raw or "").strip().strip("`").strip()
+    if not text or _NO_CHANGE in text.upper():
+        return None
+    facts = []
+    for line in text.splitlines():
+        line = line.strip()
+        m = re.match(r"^(?:[-*•]|\d+[.)])\s+(.*)$", line)
+        if m and m.group(1).strip() and m.group(1).strip().lower() not in ("(empty)", "(none)", "none"):
+            facts.append(f"- {m.group(1).strip()}")
+    if not facts:
+        # No bullets at all: either an empty profile after a "forget everything" request,
+        # or the model ignored the format. Only accept the former.
+        return "" if current.strip() and _FORGET_RE.search(user_message) else None
+    facts = list(dict.fromkeys(facts))[:_MEMORY_MAX_FACTS]
+    old = [ln for ln in current.splitlines() if ln.strip()]
+    # Small utility models sometimes return just the new fact. Refuse a big drop unless asked to forget.
+    if len(old) >= 3 and len(facts) < len(old) / 2 and not _FORGET_RE.search(user_message):
+        _log.warning("[%s] rejected update that dropped %d of %d facts", CALL_TYPE_MEMORY,
+                     len(old) - len(facts), len(old))
+        return None
+    result = "\n".join(facts)
+    return None if result == current.strip() else result
 
 
 def _short(model_id: str) -> str:
@@ -76,8 +127,11 @@ class LLMService:
         image_base64: str | None = None,
         call_type: str = CALL_TYPE_CHAT,
         context_id: str = "",
+        options: dict | None = None,
     ) -> Iterator[str]:
         """Stream a response token-by-token, logging start / done / error.
+
+        `options` holds per-chat settings ({"temperature", "effort"}); providers apply what the model supports.
 
         context_id is an optional short label (e.g. chat UUID) included in
         log lines so individual conversations can be traced in the log file.
@@ -96,7 +150,8 @@ class LLMService:
         chunks: list[str] = []
 
         try:
-            for chunk in provider.stream(messages, model_id, image_base64=image_base64):
+            kwargs = {"options": options} if options else {}
+            for chunk in provider.stream(messages, model_id, image_base64=image_base64, **kwargs):
                 chunks.append(chunk)
                 yield chunk
         except Exception as exc:
@@ -177,43 +232,65 @@ class LLMService:
         provider = self._registry.get_provider(model_id)
         return provider.count_tokens(text)
 
-    def extract_memory(self, user_message: str, current_memory: str) -> str | None:
+    def extract_memory(self, user_message: str, current_memory: str, prev_reply: str = "") -> str | None:
         """Check whether user_message contains new durable facts about the user.
 
-        Returns the updated memory string if the model decides something changed,
-        or None if nothing new was found or on any error (always safe to ignore).
+        prev_reply is the assistant message the user was answering, so short replies
+        ("Boston", "yes, Rust") can be understood. Returns the updated memory string if
+        something changed, or None if nothing new / the output looked wrong / on any error
+        (always safe to ignore).
         """
-        memory_block = current_memory.strip() or "(none)"
+        context = f"Assistant's previous message (context only):\n{prev_reply[-500:]}\n\n" if prev_reply else ""
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a memory assistant. Maintain a lean user profile from conversation messages.\n\n"
-                    "Capture: name, profession, location, tools/languages used, ongoing projects, "
-                    "stated preferences, recurring constraints.\n"
-                    "Skip: task instructions, questions, one-off or transient details.\n\n"
-                    "Rules:\n"
-                    "- Reply with ONLY the updated memory — plain text, one bullet per fact, no headers\n"
-                    "- Keep it lean: ≤15 bullets, each under 15 words\n"
-                    "- If nothing new: return the existing memory exactly unchanged\n"
-                    "- If new info: add bullets; update or remove stale entries if relevant"
-                ),
-            },
+            {"role": "system", "content": _MEMORY_SYSTEM},
             {
                 "role": "user",
                 "content": (
-                    f"Existing memory:\n{memory_block}\n\n"
-                    f"Latest message:\n{user_message[:600]}"
+                    f"Existing memory:\n{current_memory.strip() or '(empty)'}\n\n"
+                    f"{context}"
+                    f"User's latest message:\n{user_message[:_MEMORY_MSG_CHARS]}"
                 ),
             },
         ]
         try:
-            result = self.complete(messages, call_type=CALL_TYPE_MEMORY).strip()
-            if result and result != current_memory.strip():
-                return result
-            return None
+            raw = self.complete(messages, call_type=CALL_TYPE_MEMORY)
         except Exception:
             return None
+        return _parse_memory_reply(raw, current_memory, user_message)
+
+    def summarize_history(self, messages: list[dict], previous_summary: str = "") -> str:
+        """Condense older chat turns into a short brief, so a long chat fits the model's context window."""
+        transcript = "\n\n".join(f"{m['role'].upper()}: {m['content'][:4000]}" for m in messages if m.get("content"))
+        prompt = (
+            (f"Summary of the conversation so far:\n{previous_summary}\n\n" if previous_summary else "")
+            + f"Further conversation:\n{transcript[-60000:]}"
+        )
+        result = self.complete([
+            {"role": "system", "content": (
+                "Summarize this conversation so it can continue without the original messages. Keep: the user's "
+                "goals and constraints, decisions made, facts, names, numbers, code or file names that later "
+                "messages may refer to, and open questions. Bullet points, under 400 words. No preamble.")},
+            {"role": "user", "content": prompt},
+        ], call_type=CALL_TYPE_HISTORY, max_tokens=1200)
+        return result.strip()
+
+    def generate_title_from_history(self, messages: list[dict]) -> str:
+        """Title a conversation from its messages (used by the "Generate title" action)."""
+        turns = [m for m in messages if m.get("role") in ("user", "assistant") and m.get("content")]
+        if not turns:
+            return "New Chat"
+        transcript = "\n".join(f"{m['role']}: {m['content'][:400]}" for m in turns[:12])
+        try:
+            raw = self.complete([
+                {"role": "system", "content": (
+                    "Generate an ultra-short title for this conversation, covering its main topic. "
+                    "Reply with ONLY the title — no quotes, no punctuation, 6 words max.")},
+                {"role": "user", "content": transcript[:6000]},
+            ], call_type=CALL_TYPE_TITLE)
+            title = raw.strip().strip("\"'").strip()[:60]
+        except Exception:
+            title = ""
+        return title or _title_fallback(turns[0]["content"])
 
     def generate_title(self, user_message: str) -> str:
         """Generate a short chat title using the cheapest available model.

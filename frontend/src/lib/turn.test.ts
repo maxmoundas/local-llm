@@ -10,6 +10,11 @@ const act = (over: Partial<AgentAction> = {}): AgentAction => ({
 const fold = (events: StreamEvent[]) => events.reduce(applyEvent, initialTurn(0))
 
 describe('applyEvent', () => {
+  it('records a memory change', () => {
+    const s = fold([{ seq: 0, type: 'memory', added: ['Lives in Boston'], removed: [] }])
+    expect(s.memory).toEqual({ added: ['Lives in Boston'], removed: [] })
+  })
+
   it('builds a full turn from its events', () => {
     const s = fold([
       { seq: 0, type: 'task_start', task_id: 't1' },

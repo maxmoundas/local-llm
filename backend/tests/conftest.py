@@ -93,6 +93,8 @@ def isolate_data_files(tmp_path, monkeypatch):
     """
     import src.agent.sandbox as sb
     import src.chat_store as cs
+    import src.project_store as ps
+    import src.scheduler as sch
     import src.tasks.store as ts
     import src.memory_store as ms
     import src.settings_store as ss
@@ -101,6 +103,11 @@ def isolate_data_files(tmp_path, monkeypatch):
     monkeypatch.setattr(cs, "CHATS_DIR", tmp_path / "chats")
     monkeypatch.setattr(ts, "DB_PATH", tmp_path / "tasks.db")
     monkeypatch.setattr(sb, "WORKSPACES_DIR", tmp_path / "workspaces")
+    monkeypatch.setattr(ps, "PROJECTS_DIR", tmp_path / "projects")
+    monkeypatch.setattr(sch, "SCHEDULES_PATH", tmp_path / "schedules.json")
+    # TestClient sends Host: testserver; the server only accepts loopback names without a token.
+    import src.server as server
+    monkeypatch.setattr(server, "_ALLOWED_HOSTS", {*server._ALLOWED_HOSTS, "testserver"})
 
 
 def pytest_addoption(parser):

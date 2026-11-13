@@ -157,7 +157,7 @@ class TaskAgent:
 
     def run(self, history: list[dict], question: str, model_id: str, context_id: str = "",
             extra_tools: list[Tool] | None = None, controls: RunControls | None = None,
-            require_first: bool = True) -> Iterator[AgentEvent]:
+            require_first: bool = True, user_memory: str = "") -> Iterator[AgentEvent]:
         ctl = controls or RunControls()
         tools = {t.name: t for t in [*self._base_tools, *(extra_tools or [])]}
         specs = [with_status_arg(t.spec) for t in tools.values()] + [_PLAN_TOOL]
@@ -178,7 +178,8 @@ class TaskAgent:
             if stopped:
                 break
             yield AgentEvent("status", "Thinking" if step_no == 1 else "Deciding what to do next")
-            messages = self._planner_messages(history, question, plan, self._render(log, log_budget))
+            messages = self._planner_messages(history, question, plan, self._render(log, log_budget),
+                                              user_memory)
             try:
                 # The router already decided tools are needed, so the first turn must act —
                 # otherwise a model can talk itself out of looking ("the earlier reply covered it").
@@ -267,11 +268,14 @@ class TaskAgent:
             ctx = 32_000
         return max(_MIN_LOG_CHARS, min(_MAX_LOG_CHARS, ctx))  # ~4 chars/token → ctx chars ≈ ¼ of context
 
-    def _planner_messages(self, history: list[dict], question: str, plan: list[str], log_text: str) -> list[dict]:
+    def _planner_messages(self, history: list[dict], question: str, plan: list[str], log_text: str,
+                          user_memory: str = "") -> list[dict]:
         convo = "\n".join(f"{m['role']}: {m['content']}" for m in _recent(history[:-1], limit=6))
         plan_text = "\n".join(f"{i}. {s}" for i, s in enumerate(plan, 1))
         body = (
-            (f"Earlier conversation:\n{convo}\n\n" if convo else "")
+            (f"About the user (saved from past chats; use only if relevant, e.g. location for "
+             f"\"near me\"):\n{user_memory}\n\n" if user_memory else "")
+            + (f"Earlier conversation:\n{convo}\n\n" if convo else "")
             + f"Latest message:\n{question}\n\n"
             + (f"Your plan:\n{plan_text}\n\n" if plan else "")
             + f"<work_log>\n{log_text or '(nothing yet)'}\n</work_log>\n\n"

@@ -22,6 +22,14 @@ huggingface_hub>=0.25.0
 # Connectors: MCP servers (email, calendar, GitHub…) configured in connectors.yaml
 mcp>=1.10
 
+# Attachments: text from PDFs, Word, and Excel files
+pypdf>=4.0
+python-docx>=1.1
+openpyxl>=3.1
+
+# Voice input (local speech-to-text). Optional: without it the mic button is hidden.
+faster-whisper>=1.0
+
 # Server
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0

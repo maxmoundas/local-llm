@@ -4,7 +4,7 @@
  * `events.reduce(applyEvent, initialTurn())`.
  */
 import type { StreamEvent } from './sse'
-import type { AgentAction, InputRequest, Message, SourceRef, TaskFile, Usage } from '../types'
+import type { AgentAction, InputRequest, MemoryChange, Message, SourceRef, TaskFile, Usage } from '../types'
 
 export interface TurnState {
   taskId?: string
@@ -19,6 +19,7 @@ export interface TurnState {
   stopped?: boolean
   name?: string
   usage?: Usage
+  memory?: MemoryChange
   startedAt: number
   endedAt?: number
   ended: boolean        // task_end seen — nothing more will arrive
@@ -56,6 +57,8 @@ export function applyEvent(s: TurnState, e: StreamEvent): TurnState {
     }
     case 'error':
       return { ...next, notice: { kind: 'error', text: e.message } }
+    case 'memory':
+      return { ...next, memory: { added: e.added, removed: e.removed } }
     case 'done':
       return { ...next, name: e.name, files: e.files ?? s.files }
     case 'usage': {

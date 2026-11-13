@@ -10,16 +10,20 @@ Events (each also gets a `seq` from the task manager):
   token           answer text delta
   blocked         a guardrail stopped the input or output
   error           something failed
+  memory          the user's saved memory changed because of this message (added / removed facts)
   done            turn finished; carries the chat name, files, and usage
   usage / task_end   emitted by the task manager when the task ends
 """
 from __future__ import annotations
 
+import shutil
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
+from src import attachments as att
 from src import chat_store
 from src.agent.connectors import ConnectorHub
 from src.agent.router import ResearchRouter
@@ -40,11 +44,13 @@ _log = get_logger(__name__)
 class TurnDeps:
     """A snapshot of the services and settings one turn runs with."""
     svc: LLMService
-    build_messages: Callable[[dict], list[dict]]
+    build_messages: Callable[..., list[dict]]                 # (chat, model_id) → provider messages
     guardrails: GuardrailService | None = None
     guard_input: bool = True
     guard_output: bool = False
-    update_memory: Callable[[str], None] | None = None
+    # (user message, previous assistant reply) → {"added", "removed"} if memory changed, else None
+    update_memory: Callable[[str, str], dict | None] | None = None
+    user_memory: str = ""                                     # saved facts about the user, for the agent planner
     router: ResearchRouter | None = None
     agent: TaskAgent | None = None
     sandbox: Sandbox | None = None
@@ -52,43 +58,90 @@ class TurnDeps:
     agent_model_id: str | None = None   # model for agent steps; None → the chat model
     budget_usd: float | None = None
     max_seconds: float | None = None
+    # Scheduled runs: nobody is watching, so questions go unanswered and approvals are denied.
+    unattended: bool = False
+    # chat → files the agent can work on (copied into its workspace): (display name, path on disk).
+    # Called when the agent starts, so the current message's attachments are included.
+    workspace_files: Callable[[dict], list[tuple[str, Path]]] | None = None
+
+
+MODES = ("send", "edit", "regenerate")
 
 
 def run_turn(ctx: TaskContext, chat_id: str, content: str, image_base64: str | None, model_id: str,
-             deps: TurnDeps) -> None:
+             deps: TurnDeps, *, attachments: list[dict] | None = None, mode: str = "send",
+             index: int | None = None) -> None:
+    """One chat turn.
+
+    mode "send"        append `content` (+ `attachments`, already stored in the chat's files) and answer
+    mode "edit"        replace the user message at `index` with `content` (the old one stays a version)
+    mode "regenerate"  answer the last user message again; the reply at `index` (if any) stays a version
+    """
+    try:
+        _run_turn(ctx, chat_id, content, image_base64, model_id, deps, list(attachments or []), mode, index)
+    finally:
+        if mode == "regenerate":
+            chat_store.restore_fork(chat_id)  # no-op once the new reply was saved
+
+
+def _run_turn(ctx: TaskContext, chat_id: str, content: str, image_base64: str | None, model_id: str,
+              deps: TurnDeps, attachments: list[dict], mode: str, index: int | None) -> None:
     chat = chat_store.get_chat(chat_id)
-    is_new_chat = chat["name"] == "New Chat"
+    is_new_chat = chat["name"] == "New Chat" and mode == "send"
     support_note = ""
 
-    # Input guardrail — runs before appending so blocked messages aren't stored
-    if deps.guardrails is not None and deps.guard_input:
-        guard = deps.guardrails.check(content, "input")
-        if guard.blocked:
-            _log.info("Input blocked by guardrail: %s", guard.reason)
-            ctx.emit("blocked", target="input", **({"reason": guard.reason} if guard.reason else {}))
+    if image_base64:  # legacy single-image field
+        attachments.append(att.save_base64(chat_store.files_dir(chat_id), "image.png", image_base64))
+
+    if mode == "regenerate":
+        if index is not None and index < len(chat["messages"]):
+            chat = chat_store.fork(chat_id, index)
+        last_user = next((m for m in reversed(chat["messages"]) if m["role"] == "user"), None)
+        if last_user is None:
+            ctx.emit("error", message="There is no message to answer.")
             return
-        if guard.action == "support":
-            support_note = SUPPORT_SYSTEM_NOTE
+        content = last_user["content"]
+        attachments = list(last_user.get("attachments") or [])
+    else:
+        # Input guardrail — runs before saving so blocked messages aren't stored
+        if deps.guardrails is not None and deps.guard_input:
+            guard = deps.guardrails.check(content, "input")
+            if guard.blocked:
+                _log.info("Input blocked by guardrail: %s", guard.reason)
+                ctx.emit("blocked", target="input", **({"reason": guard.reason} if guard.reason else {}))
+                return
+            if guard.action == "support":
+                support_note = SUPPORT_SYSTEM_NOTE
+        if mode == "edit" and index is not None:
+            chat_store.fork(chat_id, index)
+        extra = {"attachments": attachments} if attachments else None
+        chat = chat_store.append_messages(chat_id, "user", content, model_id=model_id, extra=extra)
 
-    chat = chat_store.append_messages(chat_id, "user", content, model_id=model_id)
-    messages = deps.build_messages(chat)
+    messages = deps.build_messages(chat, model_id)
     messages[0]["content"] += support_note
+    options = _options(chat.get("settings") or {})
 
-    if deps.update_memory is not None:
-        threading.Thread(target=deps.update_memory, args=(content,), daemon=True).start()
+    if deps.update_memory is not None and mode != "regenerate":
+        prev = next((m.get("content") or "" for m in reversed(chat["messages"][:-1]) if m["role"] == "assistant"), "")
+        memory_job = _MemoryJob(deps.update_memory, content, prev)
+    else:
+        memory_job = None
 
-    extra: dict = {"task_id": ctx.task_id}
+    extra: dict = {"task_id": ctx.task_id, "model_id": model_id}
     started = time.time()
+    has_images = any(a.get("kind") == "image" for a in attachments)
 
     # Agent — the router decides per message; images skip it (tools can't see them).
-    if deps.router is not None and deps.agent is not None and not image_base64:
+    if deps.router is not None and deps.agent is not None and not has_images:
         ctx.emit("status", text="Thinking")
-        if deps.router.decide(content, chat["messages"]).research:
+        docs = [a for a in attachments if a.get("kind") == "document"]
+        route_text = content + (f"\n\n[Attached and already readable: {', '.join(d['name'] for d in docs)}]" if docs else "")
+        if deps.router.decide(route_text, chat["messages"]).research:
             try:
                 # The first planner turn must call a tool: weaker models otherwise talk themselves out
                 # of acting. An occasional false-positive route costs one cheap lookup; a missed one
                 # costs a wrong answer.
-                notes, stopped = _run_agent(ctx, chat, content, model_id, deps, extra)
+                notes, stopped = _run_agent(ctx, chat, _with_documents(chat, content, docs), model_id, deps, extra)
             except Cancelled:
                 notes, stopped = "", "cancelled"
             if ctx.cancelled:
@@ -100,8 +153,8 @@ def run_turn(ctx: TaskContext, chat_id: str, content: str, image_base64: str | N
 
     full_response = ""
     try:
-        for token in deps.svc.stream(messages, model_id, image_base64=image_base64,
-                                     call_type=CALL_TYPE_CHAT, context_id=chat_id):
+        for token in deps.svc.stream(messages, model_id, call_type=CALL_TYPE_CHAT, context_id=chat_id,
+                                     options=options):
             full_response += token
             ctx.emit("token", content=token)
             if ctx.cancelled:
@@ -130,6 +183,14 @@ def run_turn(ctx: TaskContext, chat_id: str, content: str, image_base64: str | N
             ctx.emit("blocked", target="output", **({"reason": guard.reason} if guard.reason else {}))
             return  # do not store the blocked response
 
+    # Memory extraction runs alongside the answer and usually finishes first. Wait briefly so the
+    # reply can show what was remembered; if it's slow, it still saves — just without the note.
+    if memory_job is not None:
+        change = memory_job.wait(_MEMORY_WAIT_S)
+        if change and (change.get("added") or change.get("removed")):
+            extra["memory"] = change
+            ctx.emit("memory", **change)
+
     _save(chat_id, full_response, extra, ctx, started)
 
     # On the first exchange, generate a descriptive title via the cheapest model.
@@ -137,6 +198,51 @@ def run_turn(ctx: TaskContext, chat_id: str, content: str, image_base64: str | N
         chat_store.rename_chat(chat_id, deps.svc.generate_title(content))
 
     ctx.emit("done", name=chat_store.get_chat(chat_id)["name"], files=extra.get("files", []))
+
+
+PLANNER_DOC_CHARS = 8000
+
+
+def _with_documents(chat: dict, content: str, docs: list[dict]) -> str:
+    """The user's message as the agent planner sees it: attached documents' text included (clipped)."""
+    if not docs:
+        return content
+    root = chat_store.files_dir(chat["id"])
+    parts = []
+    for d in docs:
+        text = att.text_of(root, d)
+        clipped = text[:PLANNER_DOC_CHARS] + (f"\n[… {len(text) - PLANNER_DOC_CHARS:,} more characters; the full text "
+                                              "goes to the final answer]" if len(text) > PLANNER_DOC_CHARS else "")
+        parts.append(f'<document name="{d["name"]}">\n{clipped}\n</document>')
+    return "\n\n".join([*parts, content])
+
+
+def _options(settings: dict) -> dict | None:
+    """Per-chat model options saved in chat["settings"]."""
+    out = {k: settings[k] for k in ("temperature", "effort") if settings.get(k) is not None}
+    return out or None
+
+
+_MEMORY_WAIT_S = 8.0
+
+
+class _MemoryJob:
+    """Runs the memory updater on a daemon thread and keeps its result."""
+
+    def __init__(self, fn: Callable[[str, str], dict | None], content: str, prev: str) -> None:
+        self._result: dict | None = None
+        self._thread = threading.Thread(target=self._run, args=(fn, content, prev), daemon=True, name="memory-update")
+        self._thread.start()
+
+    def _run(self, fn: Callable[[str, str], dict | None], content: str, prev: str) -> None:
+        try:
+            self._result = fn(content, prev)
+        except Exception:
+            _log.exception("Memory update failed")
+
+    def wait(self, timeout: float) -> dict | None:
+        self._thread.join(timeout)
+        return self._result
 
 
 def _run_agent(ctx: TaskContext, chat: dict, content: str, model_id: str, deps: TurnDeps,
@@ -150,9 +256,15 @@ def _run_agent(ctx: TaskContext, chat: dict, content: str, model_id: str, deps: 
     if deps.connectors is not None:
         tools += deps.connectors.tools
 
+    files_to_stage = deps.workspace_files(chat) if deps.workspace_files and deps.sandbox else []
+    uploaded = _stage_files(sb.WORKSPACES_DIR / ctx.task_id, files_to_stage)
+    if uploaded:
+        content += ("\n\n(Files the user provided are in your workspace and can be opened with code: "
+                    + ", ".join(sorted(uploaded)) + ")")
+
     controls = RunControls(
         cancelled=lambda: ctx.cancelled,
-        ask=ctx.ask,
+        ask=None if deps.unattended else ctx.ask,
         budget_usd=deps.budget_usd,
         deadline=time.monotonic() + deps.max_seconds if deps.max_seconds else None,
         meter=ctx.meter,
@@ -160,7 +272,8 @@ def _run_agent(ctx: TaskContext, chat: dict, content: str, model_id: str, deps: 
     notes, stopped = "", ""
     actions: list[dict] = []
     for evt in deps.agent.run(chat["messages"], content, deps.agent_model_id or model_id, context_id=ctx.chat_id or "",
-                              extra_tools=tools, controls=controls, require_first=require_first):
+                              extra_tools=tools, controls=controls, require_first=require_first,
+                              user_memory=deps.user_memory):
         if evt.type == "status":
             ctx.emit("status", text=evt.text)
         elif evt.type == "action":
@@ -172,10 +285,27 @@ def _run_agent(ctx: TaskContext, chat: dict, content: str, model_id: str, deps: 
                 ctx.emit("sources", sources=evt.sources)
     if actions:
         extra["actions"] = actions
-    files = list_workspace(sb.WORKSPACES_DIR / ctx.task_id)
+    files = [f for f in list_workspace(sb.WORKSPACES_DIR / ctx.task_id) if f["path"] not in uploaded]
     if files:
         extra["files"] = files
     return notes, stopped
+
+
+def _stage_files(ws: Path, files: list[tuple[str, Path]]) -> set[str]:
+    """Copy the user's files into the task workspace. Returns the names used."""
+    names: set[str] = set()
+    for name, src in files:
+        if not src.is_file():
+            continue
+        safe = Path(name).name.replace("/", "_") or src.name
+        stem, suffix, n = Path(safe).stem, Path(safe).suffix, 1
+        while safe in names:
+            n += 1
+            safe = f"{stem} ({n}){suffix}"
+        ws.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, ws / safe)
+        names.add(safe)
+    return names
 
 
 def _save(chat_id: str, content: str, extra: dict, ctx: TaskContext, started: float) -> None:

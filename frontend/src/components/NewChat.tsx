@@ -1,4 +1,4 @@
-import type { AttachedImage, ModelOption } from '../types'
+import type { ModelOption, PendingFile } from '../types'
 import Composer from './Composer'
 import { SparkIcon } from './Icons'
 
@@ -8,7 +8,8 @@ interface Props {
   modelId: string
   onModelChange: (id: string) => void
   localModelLoaded: boolean
-  onSend: (content: string, image?: AttachedImage) => void
+  voiceAvailable: boolean
+  onSend: (content: string, files: PendingFile[]) => void
 }
 
 function greeting(): string {
@@ -19,7 +20,7 @@ function greeting(): string {
   return 'Good evening'
 }
 
-export default function NewChat({ displayName, models, modelId, onModelChange, localModelLoaded, onSend }: Props) {
+export default function NewChat({ displayName, models, modelId, onModelChange, localModelLoaded, voiceAvailable, onSend }: Props) {
   const name = displayName.trim()
   return (
     <div className="new-chat-screen">
@@ -35,6 +36,7 @@ export default function NewChat({ displayName, models, modelId, onModelChange, l
           modelId={modelId}
           onModelChange={onModelChange}
           localModelLoaded={localModelLoaded}
+          voiceAvailable={voiceAvailable}
           placeholder="How can I help you today?"
           menuPlacement="down"
         />

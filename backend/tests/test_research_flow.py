@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -321,3 +322,106 @@ class TestDecideEndpoint:
         server._decision_svc = d
         resp = test_client.post("/api/decide", json={"state": "s", "questions": {"q": {"type": "noul", "instructions": "x"}}})
         assert resp.json()["answers"]["q"]["value"] == 0.8
+
+
+class TestMemoryParsing:
+    def _p(self, raw, current="", msg="hi"):
+        from src.llm_service import _parse_memory_reply
+        return _parse_memory_reply(raw, current, msg)
+
+    def test_no_change_sentinel(self):
+        assert self._p("NO_CHANGE", "- Lives in Boston") is None
+
+    def test_placeholder_echo_is_not_saved(self):
+        assert self._p("(empty)") is None
+        assert self._p("(none)") is None
+
+    def test_strips_preamble_and_normalizes_bullets(self):
+        assert self._p("Here is the updated memory:\n* Name is Sam\n1. Uses Rust") == "- Name is Sam\n- Uses Rust"
+
+    def test_rejects_big_drop_without_forget_request(self):
+        cur = "- a\n- b\n- c\n- d"
+        assert self._p("- e", cur, "I also like tea") is None
+        assert self._p("- a", cur, "please forget b, c and d") == "- a"
+
+    def test_forget_everything(self):
+        assert self._p("", "- a", "forget everything about me") is None  # empty reply is ignored
+        assert self._p("Profile cleared.", "- a", "forget everything about me") == ""
+
+    def test_unchanged_returns_none(self):
+        assert self._p("- a", "- a") is None
+
+
+class TestMemoryStore:
+    def test_legacy_placeholder_loads_empty(self, tmp_path, monkeypatch):
+        import src.memory_store as ms
+        monkeypatch.setattr(ms, "MEMORY_PATH", tmp_path / "memory.txt")
+        (tmp_path / "memory.txt").write_text("(none)")
+        assert ms.load() == ""
+
+    def test_concurrent_updates_keep_both_facts(self, tmp_path, monkeypatch):
+        import threading
+        import src.memory_store as ms
+        monkeypatch.setattr(ms, "MEMORY_PATH", tmp_path / "memory.txt")
+
+        def add(fact):
+            def fn(cur):
+                time.sleep(0.05)  # simulate the LLM call
+                return "\n".join(filter(None, [cur, fact]))
+            ms.update(fn)
+        ts = [threading.Thread(target=add, args=(f"- {x}",)) for x in "ab"]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        assert sorted(ms.load().splitlines()) == ["- a", "- b"]
+
+
+class TestMemoryInPrompt:
+    def test_memory_and_date_in_system(self, tmp_path, monkeypatch):
+        from src import server
+        import src.memory_store as ms
+        monkeypatch.setattr(ms, "MEMORY_PATH", tmp_path / "memory.txt")
+        ms.save("- Lives in Boston")
+        monkeypatch.setattr(server, "_memory_enabled", True)
+        system = server._build_messages({"messages": []})[0]["content"]
+        assert "<user_memory>" in system and "Lives in Boston" in system and "Today's date is" in system
+        monkeypatch.setattr(server, "_memory_enabled", False)
+        assert "Lives in Boston" not in server._build_messages({"messages": []})[0]["content"]
+
+
+class TestMemoryInTurn:
+    def _turn(self, test_client, update_memory):
+        from dataclasses import replace
+        from src import chat_store, server
+        from src.tasks.turn import run_turn
+        server._router = server._agent = None
+        chat_id = test_client.post("/api/chats").json()["id"]
+        model = server._registry.default_model_id
+        deps = replace(server._turn_deps(server._llm_service), update_memory=update_memory)
+        task_id = server._tasks.start(chat_id, model, lambda ctx: run_turn(ctx, chat_id, "I live in Boston", None, model, deps))
+        events = list(server._tasks.subscribe(task_id))
+        return events, chat_store.get_chat(chat_id)["messages"][-1]
+
+    def test_change_is_emitted_and_saved(self, test_client):
+        change = {"added": ["Lives in Boston"], "removed": []}
+        events, reply = self._turn(test_client, lambda text, prev: change)
+        mem = [e for e in events if e["type"] == "memory"]
+        assert mem and mem[0]["added"] == ["Lives in Boston"]
+        assert reply["memory"] == change
+
+    def test_no_change_no_event(self, test_client):
+        events, reply = self._turn(test_client, lambda text, prev: None)
+        assert "memory" not in [e["type"] for e in events] and "memory" not in reply
+
+    def test_updater_error_does_not_break_turn(self, test_client):
+        def boom(text, prev):
+            raise RuntimeError("x")
+        events, reply = self._turn(test_client, boom)
+        assert reply["role"] == "assistant" and "memory" not in reply
+
+    def test_store_update_reports_diff(self, tmp_path, monkeypatch):
+        import src.memory_store as ms
+        monkeypatch.setattr(ms, "MEMORY_PATH", tmp_path / "memory.txt")
+        ms.save("- Lives in NYC\n- Uses Rust")
+        assert ms.update(lambda cur: "- Lives in Boston\n- Uses Rust") == {
+            "added": ["Lives in Boston"], "removed": ["Lives in NYC"]}
+        assert ms.update(lambda cur: None) is None

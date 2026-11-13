@@ -6,6 +6,35 @@ export interface Chat {
   preview: string
   model_id?: string
   pinned: boolean
+  project_id?: string | null
+  schedule_id?: string | null
+}
+
+/** A file attached to a message or a project (stored by the backend). */
+export interface Attachment {
+  id: string
+  name: string
+  mime: string
+  size: number
+  kind: 'image' | 'document'
+  chars?: number
+}
+
+/** A file picked in the composer, not uploaded yet. */
+export interface PendingFile {
+  key: string
+  name: string
+  size: number
+  mime: string
+  base64: string
+  kind: 'image' | 'document'
+  dataUrl?: string   // images: local preview
+}
+
+export interface ChatSettings {
+  system_prompt?: string
+  temperature?: number
+  effort?: 'low' | 'medium' | 'high'
 }
 
 /** Saved by older versions; converted to AgentAction on load. */
@@ -44,6 +73,12 @@ export interface InputRequest {
   action_id?: string
 }
 
+/** Facts the memory system added or removed because of one message. */
+export interface MemoryChange {
+  added: string[]
+  removed: string[]
+}
+
 export interface Usage {
   input_tokens: number
   output_tokens: number
@@ -68,11 +103,76 @@ export interface Message {
   elapsed_ms?: number
   usage?: Usage
   stopped?: boolean
+  memory?: MemoryChange
+  model_id?: string
+  attachments?: Attachment[]
+  versions?: Message[][]     // the other versions of the conversation from this message on
+  version_index?: number     // where this one sits among all versions
 }
 
 export interface ChatDetail extends Chat {
   messages: Message[]
   model_id?: string
+  settings?: ChatSettings
+}
+
+export interface SearchResult extends Chat {
+  index: number | null
+  role: 'user' | 'assistant' | null
+  snippet: string
+}
+
+export interface Project {
+  id: string
+  name: string
+  description: string
+  instructions: string
+  files: Attachment[]
+  created_at: string
+  updated_at: string
+  chat_count: number
+}
+
+export interface ProjectDetail extends Project {
+  chats: Chat[]
+  memory: string
+}
+
+export type ScheduleKind = 'daily' | 'weekly' | 'interval'
+
+export interface Schedule {
+  id: string
+  name: string
+  prompt: string
+  model_id: string | null
+  project_id: string | null
+  kind: ScheduleKind
+  time?: string | null
+  days?: number[] | null
+  every_minutes?: number | null
+  enabled: boolean
+  chat_id: string | null
+  created_at: string
+  last_run_at: string | null
+  next_run_at: string | null
+  last_task_id: string | null
+  description: string
+}
+
+export interface UsageBucket {
+  cost_usd: number
+  input_tokens: number
+  output_tokens: number
+  turns: number
+}
+
+export interface UsageReport {
+  days: (UsageBucket & { date: string })[]
+  models: { model_id: string; name: string; cost_usd: number; input_tokens: number; output_tokens: number; calls: number }[]
+  chats: { chat_id: string | null; name: string; cost_usd: number; turns: number }[]
+  total: UsageBucket
+  month_to_date_usd: number
+  monthly_budget_usd: number | null
 }
 
 export interface HealthStatus {
@@ -90,8 +190,11 @@ export interface ModelOption {
   tools?: 'native' | 'prompted' | 'auto'
   vision?: boolean
   context_window?: number
+  max_output_tokens?: number
   input_price?: number
   output_price?: number
+  temperature?: boolean   // accepts a sampling temperature
+  effort?: boolean        // accepts a reasoning-effort level
 }
 
 export interface AppSettings {
@@ -122,6 +225,10 @@ export interface AppSettings {
   jev_memory: boolean
   jev_configured: boolean
   display_name: string
+  monthly_budget_usd: number | null
+  whisper_model: 'tiny' | 'base' | 'small' | 'medium' | 'large-v3'
+  transcription_available: boolean
+  access_token_set: boolean
   models: ModelOption[]
 }
 
@@ -129,9 +236,8 @@ export interface MemoryData {
   content: string
 }
 
-export interface AttachedImage {
-  base64: string    // sent to API
-  dataUrl: string   // shown in UI preview and message bubble
-  name: string
-  size: number
-}
+/** Something shown in the side preview panel. */
+export type Preview =
+  | { kind: 'html' | 'svg' | 'mermaid' | 'text' | 'markdown' | 'csv'; title: string; content: string }
+  | { kind: 'image'; title: string; url: string }
+  | { kind: 'file'; title: string; url: string }   // fetched, then shown by type

@@ -144,7 +144,8 @@ class TaskManager:
                 _log.warning("Task cleanup failed: %s", exc)
         spent = ctx.meter.snapshot()
         self._emit(live, "usage", spent)
-        store.set_status(live.task_id, status, error=error, usage=spent)
+        by_model = {k: dict(v) for k, v in ctx.meter.by_model.items()}
+        store.set_status(live.task_id, status, error=error, usage={**spent, "by_model": by_model})
         # Mark finished in the same critical section as the terminal event, so a client that
         # reacts to task_end (e.g. by sending the next message) never sees the task as active.
         with live.cond:

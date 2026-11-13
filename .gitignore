@@ -3,6 +3,7 @@ models/
 
 # Runtime data
 backend/chats/
+backend/projects/
 backend/logs/
 backend/.env
 # task database + per-task code workspaces; your MCP servers (may reference tokens)

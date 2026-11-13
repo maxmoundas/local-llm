@@ -15,7 +15,8 @@ from openai import OpenAI
 from src import usage
 from src.logger import get_logger
 from src.providers.base import (
-    REQUIRE_TOOL_NOTE, BaseProvider, ModelOption, RefusalError, ToolCall, ToolTurn, with_system_suffix,
+    EFFORT_LEVELS, REQUIRE_TOOL_NOTE, BaseProvider, ModelOption, RefusalError, ToolCall, ToolTurn, with_image,
+    with_system_suffix,
 )
 
 _log = get_logger(__name__)
@@ -23,7 +24,7 @@ _log = get_logger(__name__)
 # Used when OpenAIProvider is built without a catalog (tests, old call sites).
 _MODELS = [
     ModelOption(id="gpt-5.4-mini", name="GPT-5.4 Mini", provider="openai", is_cheapest=True, tools="native",
-                vision=True, context_window=400_000, max_output_tokens=16_000),
+                vision=True, context_window=400_000, max_output_tokens=16_000, temperature=False, effort=True),
 ]
 
 
@@ -36,6 +37,19 @@ def _media_type(b64: str) -> str:
     if head.startswith("R0lGOD"):
         return "image/gif"
     return "image/jpeg"
+
+
+def _oai_messages(messages: list[dict]) -> list[dict]:
+    """Neutral messages → Chat Completions messages (images become image_url parts)."""
+    out = []
+    for m in messages:
+        if m.get("images"):
+            parts: list[dict] = [{"type": "image_url", "image_url": {"url": f"data:{_media_type(b)};base64,{b}"}}
+                                 for b in m["images"]]
+            out.append({"role": m["role"], "content": [*parts, {"type": "text", "text": m["content"] or "(image)"}]})
+        else:
+            out.append({"role": m["role"], "content": m["content"]})
+    return out
 
 
 class OpenAICompatibleProvider(BaseProvider):
@@ -100,18 +114,20 @@ class OpenAICompatibleProvider(BaseProvider):
 
     # ── calls ─────────────────────────────────────────────────────────────
 
-    def stream(self, messages: list[dict], model_id: str, image_base64: str | None = None) -> Iterator[str]:
-        oai_messages: list[dict] = []
-        for i, m in enumerate(messages):
-            if image_base64 and m["role"] == "user" and i == len(messages) - 1:
-                url = f"data:{_media_type(image_base64)};base64,{image_base64}"
-                content = [{"type": "image_url", "image_url": {"url": url}}, {"type": "text", "text": m["content"]}]
-            else:
-                content = m["content"]
-            oai_messages.append({"role": m["role"], "content": content})
+    def _options(self, model_id: str, options: dict | None) -> dict:
+        m, opts = self.model(model_id), options or {}
+        out: dict = {}
+        if opts.get("temperature") is not None and (m is None or m.temperature):
+            out["temperature"] = float(opts["temperature"])
+        if m and m.effort and opts.get("effort") in EFFORT_LEVELS:
+            out["reasoning_effort"] = opts["effort"]
+        return out
 
-        kwargs = dict(model=model_id, messages=oai_messages, stream=True,
-                      **self._limit(model_id, None), **self._extra(model_id))
+    def stream(self, messages: list[dict], model_id: str, image_base64: str | None = None,
+               options: dict | None = None) -> Iterator[str]:
+        messages = with_image(messages, image_base64)
+        kwargs = dict(model=model_id, messages=_oai_messages(messages), stream=True,
+                      **self._limit(model_id, None), **self._extra(model_id), **self._options(model_id, options))
         if self._stream_usage:
             try:
                 stream = self._client.chat.completions.create(stream_options={"include_usage": True}, **kwargs)
@@ -140,7 +156,7 @@ class OpenAICompatibleProvider(BaseProvider):
     def complete(self, messages: list[dict], model_id: str, max_tokens: int = 1024) -> str:
         response = self._create_compat(dict(
             model=model_id,
-            messages=[{"role": m["role"], "content": m["content"]} for m in messages],
+            messages=_oai_messages(messages),
             **self._limit(model_id, max_tokens),
             stream=False,
             **self._extra(model_id),

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from PIL import Image as PILImage
 
 from src import usage
-from src.providers.base import BaseProvider, ModelOption
+from src.providers.base import BaseProvider, ModelOption, with_image
 
 if TYPE_CHECKING:  # avoid importing torch on the MLX backend
     from src.model import LocalLLM
@@ -38,18 +38,26 @@ class LocalProvider(BaseProvider):
     def ready(self) -> bool:
         return self._llm.is_loaded
 
-    def stream(self, messages: list[dict], model_id: str, image_base64: str | None = None) -> Iterator[str]:
+    def stream(self, messages: list[dict], model_id: str, image_base64: str | None = None,
+               options: dict | None = None) -> Iterator[str]:
         if not self._llm.is_loaded:
             raise RuntimeError("Local model is still loading — please wait a moment and try again")
-        if image_base64:
-            img_bytes = base64.b64decode(image_base64)
-            image = PILImage.open(BytesIO(img_bytes)).convert("RGB")
-            return _metered(self._llm.stream_with_image(image, messages), messages, model_id)
-        return _metered(self._llm.stream(messages), messages, model_id)
+        messages = with_image(messages, image_base64)
+        # The in-process model takes one image: the most recent one in the conversation.
+        latest = next((m["images"][-1] for m in reversed(messages) if m.get("images")), None)
+        plain = [{"role": m["role"], "content": m["content"]} for m in messages]
+        if latest:
+            image = PILImage.open(BytesIO(base64.b64decode(latest))).convert("RGB")
+            return _metered(self._llm.stream_with_image(image, plain), plain, model_id)
+        temperature = (options or {}).get("temperature")
+        if temperature is not None:
+            return _metered(self._llm.stream(plain, temperature=float(temperature)), plain, model_id)
+        return _metered(self._llm.stream(plain), plain, model_id)
 
     def complete(self, messages: list[dict], model_id: str, max_tokens: int | None = None) -> str:
         if not self._llm.is_loaded:
             raise RuntimeError("Local model is still loading — please wait a moment and try again")
+        messages = [{"role": m["role"], "content": m["content"]} for m in messages]
         if max_tokens is None:
             out = self._llm.generate(messages)
         else:

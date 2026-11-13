@@ -44,7 +44,7 @@ class ScriptedProvider(BaseProvider):
     def _bill(self) -> None:
         usage.record(self._models[0].id, *self.tokens)
 
-    def stream(self, messages, model_id, image_base64=None) -> Iterator[str]:
+    def stream(self, messages, model_id, image_base64=None, options=None) -> Iterator[str]:
         self.seen.append(messages)
         self._bill()
         for i, word in enumerate(self.stream_text.split(" ")):

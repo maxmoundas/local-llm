@@ -15,6 +15,14 @@ Endpoints
   GET  /api/tasks/{id}/events    ← resumable SSE (?after=<seq>)
   POST /api/tasks/{id}/cancel | reply
   GET  /api/tasks/{id}/files/{path}
+  POST /api/chats/{id}/regenerate | edit | versions | title | files
+  GET  /api/chats/{id}/files/{file_id} | export
+  GET  /api/search?q=            ← full-text search over every chat
+  /api/projects/*                ← projects: instructions, knowledge files, memory
+  /api/schedules/*               ← scheduled tasks
+  GET  /api/usage                ← spend by day / model / chat
+  POST /api/transcribe           ← local Whisper speech-to-text
+  GET  /api/auth/status, POST /api/auth/login | logout
   GET  /api/connectors
   GET/PATCH /api/settings
   GET/PATCH /api/memory
@@ -24,27 +32,35 @@ Endpoints
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlsplit
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from starlette.responses import FileResponse, Response, StreamingResponse
+from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
-from src import chat_store, decision_service, memory_store, settings_store
+from src import attachments, chat_store, context, decision_service, memory_store, project_store, scheduler
+from src import settings_store, transcribe
 from src.agent.connectors import ConnectorHub
 from src.agent.router import ResearchRouter
 from src.agent.runner import TaskAgent
 from src.agent import sandbox as sb
 from src.agent.sandbox import Sandbox, detect_sandbox, safe_path
+from src.attachments import AttachmentError
 from src.agent.tools import default_tools
 from src.config import load_config
 from src.decision_service import CALL_TYPE_MEMORY, DecisionError, DecisionService, noul
@@ -53,6 +69,7 @@ from src.llm_service import LLMService
 from src.logger import get_logger, setup_logging
 from src.model_factory import create_local_llm
 from src.providers import ProviderRegistry, build_registry
+from src.providers.base import EFFORT_LEVELS
 from src.settings_store import DEFAULT_GUARDRAIL_PROMPT, DEFAULT_SYSTEM_PROMPT
 from src.tasks import store as task_store
 from src.tasks.manager import TaskManager
@@ -80,20 +97,51 @@ _sandbox_key: tuple | None = None
 _connectors = ConnectorHub()
 _tasks = TaskManager()
 _task_limits: dict = {}
+_monthly_budget: float | None = None
+_whisper_model: str = "base"
+_scheduler: scheduler.Scheduler | None = None
+
+# ── Network security ─────────────────────────────────────────────────────
+# The server binds to loopback by default. Set ACCESS_TOKEN (backend/.env) before exposing it on a
+# network: every /api and /v1 request then needs the token (cookie from /api/auth/login, or an
+# `Authorization: Bearer` header for API clients). Without a token, requests must address the server
+# by a loopback host name, which blocks DNS-rebinding attacks from web pages.
+_SERVER_CFG = load_config().get("server", {})
+_ACCESS_TOKEN = os.getenv("ACCESS_TOKEN") or _SERVER_CFG.get("access_token") or ""
+_ALLOWED_ORIGINS = set(_SERVER_CFG.get("cors_origins") or [
+    "http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:4173", "http://127.0.0.1:4173",
+])
+_ALLOWED_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]", *(_SERVER_CFG.get("allowed_hosts") or [])}
+_AUTH_COOKIE = "llm_session"
+_OPEN_PATHS = {"/health", "/api/auth/status", "/api/auth/login", "/api/auth/logout"}
 
 _MEMORY_THRESHOLD = 0.4
 _HAS_DURABLE_FACT = noul(
     "The message reveals a lasting personal fact about the sender (their name, job, location, tools or languages "
     "they use, ongoing projects, stated preferences, or recurring constraints) worth remembering for future "
-    "conversations.",
-    true="It states something durable about who the sender is, what they work on, or how they like things done.",
+    "conversations, or explicitly asks the assistant to remember, forget, or correct something about them.",
+    true="It states something durable about who the sender is, what they work on, or how they like things done, "
+         "or asks for something to be remembered or forgotten.",
     false="It is only a question, task, or one-off detail with nothing lasting about the sender.",
 )
+
+_MEMORY_SECTION = """
+
+<user_memory>
+Facts about the user saved from earlier conversations (may be out of date):
+{memory}
+</user_memory>
+Use these to personalize answers only when relevant. Don't recite or mention them unless asked; \
+if the user says something that contradicts them, trust the user."""
+
+
+def _memory_context() -> str:
+    return memory_store.load() if _memory_enabled else ""
 
 
 def _apply_settings(s: dict) -> None:
     """(Re)build every settings-driven service. Called at startup and after each PATCH."""
-    global _system_prompt, _memory_enabled, _jev_memory
+    global _system_prompt, _memory_enabled, _jev_memory, _monthly_budget, _whisper_model
     global _guardrail_svc, _guardrails_input, _guardrails_output, _router, _agent, _sandbox, _sandbox_key
 
     if _llm_service is not None:
@@ -101,6 +149,8 @@ def _apply_settings(s: dict) -> None:
     _system_prompt = s.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
     _memory_enabled = bool(s.get("memory_enabled", True))
     _jev_memory = bool(s.get("jev_memory", True))
+    _monthly_budget = float(s["monthly_budget_usd"]) if s.get("monthly_budget_usd") else None
+    _whisper_model = s.get("whisper_model") or "base"
 
     if _decision_svc is not None:
         _decision_svc.enabled = bool(s.get("jev_enabled", True))
@@ -157,7 +207,11 @@ async def lifespan(app: FastAPI):
                 "on" if _agent else "off", _sandbox.name if _sandbox else "off")
     threading.Thread(target=_llm.load, daemon=True, name="model-loader").start()
     threading.Thread(target=_start_connectors, daemon=True, name="connectors-start").start()
+    global _scheduler
+    _scheduler = scheduler.Scheduler(_start_scheduled_run)
+    _scheduler.start()
     yield
+    _scheduler.stop()
     _connectors.stop()
 
 
@@ -171,10 +225,50 @@ app = FastAPI(title="Local LLM API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=sorted(_ALLOWED_ORIGINS),
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Task-Id"],
 )
+
+
+def _token_ok(candidate: str | None) -> bool:
+    if not candidate:
+        return False
+    return hmac.compare_digest(hashlib.sha256(candidate.encode()).digest(),
+                               hashlib.sha256(_ACCESS_TOKEN.encode()).digest())
+
+
+def _authorized(request: Request) -> bool:
+    if not _ACCESS_TOKEN:
+        return True
+    header = request.headers.get("authorization", "")
+    bearer = header[7:].strip() if header.lower().startswith("bearer ") else None
+    return _token_ok(bearer) or _token_ok(request.cookies.get(_AUTH_COOKIE))
+
+
+def _host_name(host_header: str) -> str:
+    return urlsplit(f"//{host_header}").hostname or ""
+
+
+@app.middleware("http")
+async def _security(request: Request, call_next):
+    """Host check (DNS rebinding), Origin check (cross-site requests), and the optional access token."""
+    path = request.url.path
+    host = _host_name(request.headers.get("host", ""))
+    if not _ACCESS_TOKEN and host not in _ALLOWED_HOSTS:
+        return JSONResponse({"detail": f"Host {host!r} not allowed. Set ACCESS_TOKEN to serve on a network, "
+                                       "or add the name to server.allowed_hosts in config.yaml."}, status_code=403)
+    origin = request.headers.get("origin")
+    if origin and request.method not in ("GET", "HEAD", "OPTIONS"):
+        same_origin = urlsplit(origin).netloc == request.headers.get("host", "")
+        if not same_origin and origin not in _ALLOWED_ORIGINS:
+            return JSONResponse({"detail": "Cross-origin request blocked"}, status_code=403)
+    if (path.startswith("/api") or path.startswith("/v1")) and path not in _OPEN_PATHS \
+            and request.method != "OPTIONS" and not _authorized(request):
+        return JSONResponse({"detail": "Authentication required"}, status_code=401)
+    return await call_next(request)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -197,30 +291,85 @@ def _require_service() -> LLMService:
     return _llm_service
 
 
-def _build_messages(chat: dict) -> list[dict]:
-    """Provider-ready history: system prompt first, display-only fields stripped.
+_PROJECT_SECTION = """
+
+<project name="{name}">
+This conversation is part of the user's project "{name}".{description}{instructions}{memory}{knowledge}
+</project>"""
+
+KNOWLEDGE_SHARE = 0.4  # at most this share of the context window goes to project knowledge files
+
+
+def _project_of(chat: dict) -> dict | None:
+    return project_store.get(chat["project_id"]) if chat.get("project_id") else None
+
+
+def _model_or_none(model_id: str | None):
+    if not model_id or _registry is None:
+        return None
+    try:
+        return _registry.get_model(model_id)
+    except KeyError:
+        return None
+
+
+def _project_section(project: dict, model) -> str:
+    desc = f"\nAbout it: {project['description']}" if project.get("description") else ""
+    instr = f"\n\nProject instructions (follow these):\n{project['instructions']}" if project.get("instructions") else ""
+    mem_text = memory_store.load(project_store.memory_path(project["id"])) if _memory_enabled else ""
+    mem = f"\n\nFacts learned in this project's chats:\n{mem_text}" if mem_text else ""
+    docs, budget = [], context.budget_for(model) * KNOWLEDGE_SHARE
+    for meta, text in project_store.knowledge(project):
+        cost = context.estimate_tokens(text)
+        if cost > budget:
+            text = text[: int(max(budget, 0) * context.CHARS_PER_TOKEN)] + "\n[… truncated to fit the context window]"
+            cost = budget
+        if budget <= 0:
+            docs.append(f'<document name="{meta["name"]}">(omitted: knowledge files exceed the context window)</document>')
+            continue
+        docs.append(context.document_block(meta["name"], text))
+        budget -= cost
+    knowledge = ("\n\nProject knowledge files:\n" + "\n\n".join(docs)) if docs else ""
+    return _PROJECT_SECTION.format(name=project["name"], description=desc, instructions=instr, memory=mem,
+                                   knowledge=knowledge)
+
+
+def _system_for(chat: dict, model=None) -> str:
+    """System prompt: the chat's own prompt (or the global one), date, memory, and its project."""
+    now = datetime.now()
+    custom = ((chat.get("settings") or {}).get("system_prompt") or "").strip()
+    system = f"{custom or _system_prompt}\n\nToday's date is {now:%A, %B} {now.day}, {now.year}."
+    mem = _memory_context()
+    if mem:
+        system += _MEMORY_SECTION.format(memory=mem)
+    project = _project_of(chat)
+    if project:
+        system += _project_section(project, model)
+    return system
+
+
+def _build_messages(chat: dict, model_id: str | None = None) -> list[dict]:
+    """Provider-ready history: system prompt first, attachments expanded, fitted to the model's context.
 
     Empty turns (e.g. a reply stopped before any text) are dropped and consecutive
     same-role turns merged, since some providers require strict user/assistant alternation.
     """
-    system = _system_prompt
-    if _memory_enabled:
-        mem = memory_store.load()
-        if mem:
-            system = f"{system}\n\n[User Memory]\n{mem}"
-    out: list[dict] = [{"role": "system", "content": system}]
-    for m in chat.get("messages", []):
-        if m["role"] == "system" or not m.get("content"):
-            continue
-        if out[-1]["role"] == m["role"]:
-            out[-1] = {"role": m["role"], "content": f"{out[-1]['content']}\n\n{m['content']}"}
-        else:
-            out.append({"role": m["role"], "content": m["content"]})
-    return out
+    model = _model_or_none(model_id)
+    chat_id = chat.get("id")
+    summarize = _llm_service.summarize_history if _llm_service is not None else None
+    return context.build(
+        chat, _system_for(chat, model), model,
+        files_root=chat_store.files_dir(chat_id) if chat_id else None,
+        summarize=summarize,
+        save_summary=(lambda summary: chat_store.update_chat(chat_id, context_summary=summary)) if chat_id else None,
+    )
 
 
-def _maybe_update_memory(user_message: str, svc: LLMService) -> None:
+def _maybe_update_memory(user_message: str, svc: LLMService, prev_reply: str = "",
+                         path: Path | None = None) -> dict | None:
     """Background task: extract durable facts from the user message and update memory if changed.
+
+    Returns {"added": [...], "removed": [...]} when memory changed, else None.
 
     When Jev is on for memory, it first checks whether the message holds anything worth
     remembering, which skips the LLM call for the large majority of messages.
@@ -230,14 +379,14 @@ def _maybe_update_memory(user_message: str, svc: LLMService) -> None:
             p = _decision_svc.ask({"message": user_message[:2000]}, {"durable": _HAS_DURABLE_FACT},
                                   call_type=CALL_TYPE_MEMORY)["durable"].noul
             if p < _MEMORY_THRESHOLD:
-                return
+                return None
         except DecisionError:
             pass  # no gate — let the LLM decide
-    current = memory_store.load()
-    updated = svc.extract_memory(user_message, current)
-    if updated is not None:
-        memory_store.save(updated)
-        logger.info("Memory updated")
+    # Under the store's lock so concurrent turns can't drop each other's updates.
+    change = memory_store.update(lambda current: svc.extract_memory(user_message, current, prev_reply), path)
+    if change:
+        logger.info("Memory updated (+%d / -%d)", len(change["added"]), len(change["removed"]))
+    return change
 
 
 def _model_dicts(registry: ProviderRegistry) -> list[dict]:
@@ -264,24 +413,40 @@ async def api_list_models() -> list[dict]:
 
 # ── Chat management (/api/chats/*) ─────────────────────────────────────
 
-class RenameRequest(BaseModel):
-    name: str
+class ChatSettings(BaseModel):
+    system_prompt: str | None = None
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    effort: Literal["low", "medium", "high"] | None = None
+
+
+class ChatUpdate(BaseModel):
+    name: str | None = None
+    project_id: str | None = None        # "" removes the chat from its project
+    settings: ChatSettings | None = None
 
 
 class MessageRequest(BaseModel):
-    content: str
-    image_base64: str | None = None
+    content: str = ""
+    image_base64: str | None = None      # legacy single image; prefer `attachments`
+    attachments: list[str] | None = None  # ids returned by POST /api/chats/{id}/files
     model_id: str | None = None
 
 
+class CreateChatRequest(BaseModel):
+    project_id: str | None = None
+
+
 @app.get("/api/chats")
-async def api_list_chats() -> list[dict]:
-    return chat_store.list_chats()
+async def api_list_chats(project_id: str | None = None) -> list[dict]:
+    return chat_store.list_chats(project_id)
 
 
 @app.post("/api/chats", status_code=201)
-async def api_create_chat() -> dict:
-    return chat_store.create_chat()
+async def api_create_chat(req: CreateChatRequest | None = None) -> dict:
+    project_id = req.project_id if req else None
+    if project_id and project_store.get(project_id) is None:
+        raise HTTPException(404, "Project not found")
+    return chat_store.create_chat(project_id=project_id)
 
 
 @app.get("/api/chats/{chat_id}")
@@ -293,10 +458,19 @@ async def api_get_chat(chat_id: str) -> dict:
 
 
 @app.patch("/api/chats/{chat_id}")
-async def api_rename_chat(chat_id: str, req: RenameRequest) -> dict:
-    chat = chat_store.rename_chat(chat_id, req.name)
+async def api_update_chat(chat_id: str, req: ChatUpdate) -> dict:
+    chat = chat_store.get_chat(chat_id)
     if chat is None:
         raise HTTPException(404, "Chat not found")
+    if req.name is not None:
+        chat = chat_store.rename_chat(chat_id, req.name)
+    if req.project_id is not None:
+        if req.project_id and project_store.get(req.project_id) is None:
+            raise HTTPException(404, "Project not found")
+        chat = chat_store.update_chat(chat_id, project_id=req.project_id or None)
+    if req.settings is not None:
+        settings = {k: v for k, v in req.settings.model_dump().items() if v not in (None, "")}
+        chat = chat_store.update_chat(chat_id, settings=settings or None)
     return chat
 
 
@@ -343,6 +517,8 @@ class SettingsUpdate(BaseModel):
     jev_guardrails: bool | None = None
     jev_memory: bool | None = None
     display_name: str | None = None
+    monthly_budget_usd: float | None = Field(default=None, ge=0, le=100_000)
+    whisper_model: Literal["tiny", "base", "small", "medium", "large-v3"] | None = None
 
 
 @app.get("/api/settings")
@@ -357,6 +533,8 @@ async def api_get_settings() -> dict:
         "models": _model_dicts(registry),
         "sandbox_active": _sandbox.name if _sandbox else "off",
         "connectors": _connectors.status(),
+        "transcription_available": transcribe.available(),
+        "access_token_set": bool(_ACCESS_TOKEN),
     }
 
 
@@ -383,7 +561,8 @@ async def api_get_memory() -> dict:
 
 @app.patch("/api/memory")
 async def api_update_memory(req: MemoryUpdate) -> dict:
-    memory_store.save(req.content)
+    # Off the event loop: save() waits if a background extraction is mid-update.
+    await run_in_threadpool(memory_store.save, req.content)
     return {"content": req.content.strip()}
 
 
@@ -424,14 +603,35 @@ def _sse_stream(task_id: str, after: int):
         yield f"id: {evt['seq']}\ndata: {json.dumps(evt)}\n\n"
 
 
-def _turn_deps(svc: LLMService) -> TurnDeps:
+def _workspace_files(chat: dict | None) -> list[tuple[str, Path]]:
+    """The user's files in this chat (and its project) that the agent may open with code."""
+    if not chat:
+        return []
+    out = []
+    root = chat_store.files_dir(chat["id"])
+    for m in chat.get("messages", []):
+        for f in m.get("attachments") or []:
+            p = attachments.path_for(root, f)
+            if p:
+                out.append((f["name"], p))
+    project = _project_of(chat)
+    if project:
+        proot = project_store.files_dir(project["id"])
+        out += [(f["name"], p) for f in project.get("files", []) if (p := attachments.path_for(proot, f))]
+    return out
+
+
+def _turn_deps(svc: LLMService, chat: dict | None = None, unattended: bool = False) -> TurnDeps:
+    # Chats in a project learn into that project's memory; other chats into the user's profile.
+    mem_path = project_store.memory_path(chat["project_id"]) if chat and chat.get("project_id") else None
     return TurnDeps(
         svc=svc,
         build_messages=_build_messages,
         guardrails=_guardrail_svc,
         guard_input=_guardrails_input,
         guard_output=_guardrails_output,
-        update_memory=(lambda text: _maybe_update_memory(text, svc)) if _memory_enabled else None,
+        update_memory=(lambda text, prev="": _maybe_update_memory(text, svc, prev, mem_path)) if _memory_enabled else None,
+        user_memory=_memory_context(),
         router=_router,
         agent=_agent,
         sandbox=_sandbox,
@@ -439,7 +639,57 @@ def _turn_deps(svc: LLMService) -> TurnDeps:
         agent_model_id=_task_limits.get("agent_model_id"),
         budget_usd=_task_limits.get("budget_usd"),
         max_seconds=_task_limits.get("max_seconds"),
+        unattended=unattended,
+        workspace_files=_workspace_files,
     )
+
+
+def _month_spend() -> float:
+    start = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
+    return sum((t["usage"] or {}).get("cost_usd", 0.0) for t in task_store.usage_since(start))
+
+
+def _start_turn(chat_id: str, model_id: str | None, unattended: bool = False, **turn_kwargs) -> tuple[str, str]:
+    """Validate and start a turn as a background task. Returns (task_id, model_id)."""
+    registry = _require_registry()
+    svc = _require_service()
+    chat = chat_store.get_chat(chat_id)
+    if chat is None:
+        raise HTTPException(404, "Chat not found")
+    if _tasks.active_for_chat(chat_id):
+        raise HTTPException(409, "This chat is still working on the previous message")
+    model_id = model_id or registry.default_model_id
+    try:
+        registry.get_provider(model_id)  # validate model exists
+    except KeyError:
+        raise HTTPException(400, f"Unknown model: {model_id}")
+    if _monthly_budget is not None:
+        spent = _month_spend()
+        if spent >= _monthly_budget:
+            raise HTTPException(402, f"Monthly spending limit reached (${spent:.2f} of ${_monthly_budget:.2f}). "
+                                     "Raise it in Settings → Usage.")
+    deps = _turn_deps(svc, chat, unattended=unattended)
+    content = turn_kwargs.pop("content", "")
+    image_base64 = turn_kwargs.pop("image_base64", None)
+    task_id = _tasks.start(chat_id, model_id,
+                           lambda ctx: run_turn(ctx, chat_id, content, image_base64, model_id, deps, **turn_kwargs))
+    return task_id, model_id
+
+
+def _stream_task(task_id: str) -> StreamingResponse:
+    return StreamingResponse(_sse_stream(task_id, -1), media_type="text/event-stream",
+                             headers={**_SSE_HEADERS, "X-Task-Id": task_id})
+
+
+def _resolve_attachments(chat_id: str, ids: list[str]) -> list[dict]:
+    root = chat_store.files_dir(chat_id)
+    metas = []
+    for file_id in ids:
+        meta = attachments.load_meta(root, file_id)
+        if meta is None:
+            raise HTTPException(400, f"Unknown attachment: {file_id}")
+        metas.append(meta)
+    return metas
 
 
 @app.post("/api/chats/{chat_id}/message")
@@ -449,24 +699,124 @@ async def api_send_message(chat_id: str, req: MessageRequest) -> Any:
     The task keeps running if the client disconnects; reconnect with
     GET /api/tasks/{task_id}/events?after=<last seq>. Stop it with POST /api/tasks/{id}/cancel.
     """
-    registry = _require_registry()
-    svc = _require_service()
+    metas = _resolve_attachments(chat_id, req.attachments) if req.attachments else []
+    if not req.content.strip() and not metas and not req.image_base64:
+        raise HTTPException(400, "Message is empty")
+    task_id, _ = _start_turn(chat_id, req.model_id, content=req.content, image_base64=req.image_base64,
+                             attachments=metas)
+    return _stream_task(task_id)
+
+
+class RegenerateRequest(BaseModel):
+    index: int | None = None     # the assistant message to replace; None = answer the last user message
+    model_id: str | None = None
+
+
+@app.post("/api/chats/{chat_id}/regenerate")
+async def api_regenerate(chat_id: str, req: RegenerateRequest) -> Any:
+    chat = chat_store.get_chat(chat_id)
+    if chat is None:
+        raise HTTPException(404, "Chat not found")
+    msgs = chat["messages"]
+    if req.index is not None and (not 0 <= req.index < len(msgs) or msgs[req.index]["role"] != "assistant"):
+        raise HTTPException(400, "index must point at an assistant message")
+    task_id, _ = _start_turn(chat_id, req.model_id, mode="regenerate", index=req.index)
+    return _stream_task(task_id)
+
+
+class EditRequest(BaseModel):
+    index: int
+    content: str
+    model_id: str | None = None
+    attachments: list[str] | None = None   # ids; None keeps the original message's attachments
+
+
+@app.post("/api/chats/{chat_id}/edit")
+async def api_edit(chat_id: str, req: EditRequest) -> Any:
+    chat = chat_store.get_chat(chat_id)
+    if chat is None:
+        raise HTTPException(404, "Chat not found")
+    msgs = chat["messages"]
+    if not 0 <= req.index < len(msgs) or msgs[req.index]["role"] != "user":
+        raise HTTPException(400, "index must point at a user message")
+    metas = (_resolve_attachments(chat_id, req.attachments) if req.attachments is not None
+             else list(msgs[req.index].get("attachments") or []))
+    if not req.content.strip() and not metas:
+        raise HTTPException(400, "Message is empty")
+    task_id, _ = _start_turn(chat_id, req.model_id, content=req.content, attachments=metas, mode="edit",
+                             index=req.index)
+    return _stream_task(task_id)
+
+
+class VersionRequest(BaseModel):
+    index: int
+    version: int
+
+
+@app.post("/api/chats/{chat_id}/versions")
+async def api_switch_version(chat_id: str, req: VersionRequest) -> dict:
+    if _tasks.active_for_chat(chat_id):
+        raise HTTPException(409, "Wait for the current reply to finish")
+    chat = chat_store.switch_version(chat_id, req.index, req.version)
+    if chat is None:
+        raise HTTPException(400, "No such version")
+    return chat
+
+
+@app.post("/api/chats/{chat_id}/title")
+async def api_generate_title(chat_id: str) -> dict:
+    chat = chat_store.get_chat(chat_id)
+    if chat is None:
+        raise HTTPException(404, "Chat not found")
+    title = await run_in_threadpool(_require_service().generate_title_from_history, chat["messages"])
+    return chat_store.rename_chat(chat_id, title)
+
+
+class FileUpload(BaseModel):
+    name: str
+    data_base64: str
+    mime: str | None = None
+
+
+@app.post("/api/chats/{chat_id}/files", status_code=201)
+async def api_upload_chat_file(chat_id: str, req: FileUpload) -> dict:
     if chat_store.get_chat(chat_id) is None:
         raise HTTPException(404, "Chat not found")
-    if _tasks.active_for_chat(chat_id):
-        raise HTTPException(409, "This chat is still working on the previous message")
-
-    model_id = req.model_id or registry.default_model_id
     try:
-        registry.get_provider(model_id)  # validate model exists
-    except KeyError:
-        raise HTTPException(400, f"Unknown model: {model_id}")
+        return await run_in_threadpool(attachments.save_base64, chat_store.files_dir(chat_id), req.name,
+                                       req.data_base64, req.mime)
+    except AttachmentError as exc:
+        raise HTTPException(400, str(exc))
 
-    deps = _turn_deps(svc)
-    task_id = _tasks.start(chat_id, model_id,
-                           lambda ctx: run_turn(ctx, chat_id, req.content, req.image_base64, model_id, deps))
-    return StreamingResponse(_sse_stream(task_id, -1), media_type="text/event-stream",
-                             headers={**_SSE_HEADERS, "X-Task-Id": task_id})
+
+@app.get("/api/chats/{chat_id}/files/{file_id}")
+async def api_chat_file(chat_id: str, file_id: str, download: bool = False) -> Any:
+    root = chat_store.files_dir(chat_id)
+    meta, path = attachments.load_meta(root, file_id), attachments.path_for(root, file_id)
+    if meta is None or path is None:
+        raise HTTPException(404, "File not found")
+    if meta["kind"] == "image" and not download:
+        return FileResponse(path, media_type=meta["mime"])
+    return FileResponse(path, filename=meta["name"], media_type=meta["mime"])
+
+
+@app.get("/api/chats/{chat_id}/export")
+async def api_export_chat(chat_id: str, format: Literal["md", "json"] = "md") -> Response:
+    chat = chat_store.get_chat(chat_id)
+    if chat is None:
+        raise HTTPException(404, "Chat not found")
+    stem = "".join(c if c.isalnum() or c in " -_" else "_" for c in chat["name"]).strip()[:60] or "chat"
+    if format == "json":
+        body, media = json.dumps(chat_store.export_json(chat), indent=2), "application/json"
+    else:
+        body, media = chat_store.export_markdown(chat), "text/markdown; charset=utf-8"
+    return Response(body, media_type=media,
+                    headers={"Content-Disposition": f'attachment; filename="{stem}.{format}"'})
+
+
+@app.get("/api/search")
+async def api_search(q: str = "", limit: int = 50) -> list[dict]:
+    return await run_in_threadpool(chat_store.search, q, max(1, min(limit, 200)))
 
 
 @app.get("/api/chats/{chat_id}/active")
@@ -527,6 +877,284 @@ async def api_task_file(task_id: str, path: str) -> Any:
 @app.get("/api/connectors")
 async def api_connectors() -> dict:
     return {"connectors": _connectors.status(), "tools": [t.name for t in _connectors.tools]}
+
+
+# ── Projects (/api/projects) ──────────────────────────────────────────
+
+class ProjectCreate(BaseModel):
+    name: str
+    description: str = ""
+    instructions: str = ""
+
+
+class ProjectUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    instructions: str | None = None
+
+
+def _project_or_404(project_id: str) -> dict:
+    project = project_store.get(project_id)
+    if project is None:
+        raise HTTPException(404, "Project not found")
+    return project
+
+
+def _project_out(project: dict) -> dict:
+    chats = chat_store.list_chats(project["id"])
+    return {**project, "chat_count": len(chats)}
+
+
+@app.get("/api/projects")
+async def api_list_projects() -> list[dict]:
+    return [_project_out(p) for p in project_store.list_projects()]
+
+
+@app.post("/api/projects", status_code=201)
+async def api_create_project(req: ProjectCreate) -> dict:
+    return _project_out(project_store.create(req.name, req.description, req.instructions))
+
+
+@app.get("/api/projects/{project_id}")
+async def api_get_project(project_id: str) -> dict:
+    project = _project_or_404(project_id)
+    return {**_project_out(project), "chats": chat_store.list_chats(project_id),
+            "memory": memory_store.load(project_store.memory_path(project_id))}
+
+
+@app.patch("/api/projects/{project_id}")
+async def api_update_project(project_id: str, req: ProjectUpdate) -> dict:
+    _project_or_404(project_id)
+    return _project_out(project_store.update(project_id, **req.model_dump()))
+
+
+@app.delete("/api/projects/{project_id}", status_code=204, response_class=Response)
+async def api_delete_project(project_id: str) -> Response:
+    _project_or_404(project_id)
+    for c in chat_store.list_chats(project_id):  # chats survive, outside any project
+        chat_store.update_chat(c["id"], project_id=None)
+    project_store.delete(project_id)
+    return Response(status_code=204)
+
+
+@app.post("/api/projects/{project_id}/files", status_code=201)
+async def api_add_project_file(project_id: str, req: FileUpload) -> dict:
+    _project_or_404(project_id)
+    try:
+        return await run_in_threadpool(project_store.add_file, project_id, req.name, req.data_base64, req.mime)
+    except AttachmentError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.delete("/api/projects/{project_id}/files/{file_id}", status_code=204, response_class=Response)
+async def api_remove_project_file(project_id: str, file_id: str) -> Response:
+    if not project_store.remove_file(project_id, file_id):
+        raise HTTPException(404, "File not found")
+    return Response(status_code=204)
+
+
+@app.get("/api/projects/{project_id}/files/{file_id}")
+async def api_project_file(project_id: str, file_id: str) -> Any:
+    root = project_store.files_dir(project_id)
+    meta, path = attachments.load_meta(root, file_id), attachments.path_for(root, file_id)
+    if meta is None or path is None:
+        raise HTTPException(404, "File not found")
+    return FileResponse(path, filename=meta["name"], media_type=meta["mime"])
+
+
+@app.patch("/api/projects/{project_id}/memory")
+async def api_update_project_memory(project_id: str, req: MemoryUpdate) -> dict:
+    _project_or_404(project_id)
+    await run_in_threadpool(memory_store.save, req.content, project_store.memory_path(project_id))
+    return {"content": req.content.strip()}
+
+
+# ── Usage (/api/usage) ─────────────────────────────────────────────────
+
+@app.get("/api/usage")
+async def api_usage(days: int = 30) -> dict:
+    """Spending and tokens by day, model, and chat over the last `days` days, plus month to date."""
+    days = max(1, min(days, 365))
+    now = datetime.now()
+    since = (now - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    rows = await run_in_threadpool(task_store.usage_since, min(since, month_start).timestamp())
+    names = {m.id: m.name for m in _registry.list_models()} if _registry else {}
+    chat_names = {c["id"]: c["name"] for c in chat_store.list_chats()}
+
+    per_day = {(since + timedelta(days=i)).strftime("%Y-%m-%d"): {"cost_usd": 0.0, "input_tokens": 0,
+                                                                   "output_tokens": 0, "turns": 0}
+               for i in range(days)}
+    per_model: dict[str, dict] = {}
+    per_chat: dict[str, dict] = {}
+    total = {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0, "turns": 0}
+    month = 0.0
+    for t in rows:
+        u = t["usage"] or {}
+        cost = float(u.get("cost_usd") or 0.0)
+        if t["created_at"] >= month_start.timestamp():
+            month += cost
+        if t["created_at"] < since.timestamp():
+            continue
+        day = datetime.fromtimestamp(t["created_at"]).strftime("%Y-%m-%d")
+        d = per_day.setdefault(day, {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0, "turns": 0})
+        for bucket in (d, total):
+            bucket["cost_usd"] += cost
+            bucket["input_tokens"] += int(u.get("input_tokens") or 0)
+            bucket["output_tokens"] += int(u.get("output_tokens") or 0)
+            bucket["turns"] += 1
+        by_model = u.get("by_model") or ({t["model_id"]: u} if t.get("model_id") else {})
+        for mid, mu in by_model.items():
+            m = per_model.setdefault(mid, {"model_id": mid, "name": names.get(mid, mid), "cost_usd": 0.0,
+                                           "input_tokens": 0, "output_tokens": 0, "calls": 0})
+            m["cost_usd"] += float(mu.get("cost_usd") or 0.0)
+            m["input_tokens"] += int(mu.get("input_tokens") or 0)
+            m["output_tokens"] += int(mu.get("output_tokens") or 0)
+            m["calls"] += int(mu.get("calls") or 0)
+        key = t.get("chat_id") or ""
+        c = per_chat.setdefault(key, {"chat_id": t.get("chat_id"),
+                                      "name": chat_names.get(key, "Deleted chats") if key else "Deleted chats",
+                                      "cost_usd": 0.0, "turns": 0})
+        c["cost_usd"] += cost
+        c["turns"] += 1
+
+    def rounded(d: dict) -> dict:
+        return {**d, "cost_usd": round(d["cost_usd"], 6)}
+
+    return {
+        "days": [{"date": k, **rounded(v)} for k, v in sorted(per_day.items())],
+        "models": sorted((rounded(m) for m in per_model.values()), key=lambda m: -m["cost_usd"]),
+        "chats": sorted((rounded(c) for c in per_chat.values()), key=lambda c: -c["cost_usd"])[:15],
+        "total": rounded(total),
+        "month_to_date_usd": round(month, 6),
+        "monthly_budget_usd": _monthly_budget,
+    }
+
+
+# ── Scheduled tasks (/api/schedules) ───────────────────────────────────
+
+class ScheduleIn(BaseModel):
+    name: str | None = None
+    prompt: str | None = None
+    model_id: str | None = None
+    project_id: str | None = None
+    kind: Literal["daily", "weekly", "interval"] | None = None
+    time: str | None = None
+    days: list[int] | None = None
+    every_minutes: int | None = None
+    enabled: bool | None = None
+
+
+def _start_scheduled_run(s: dict) -> tuple[str | None, str | None]:
+    """Post a schedule's prompt to its chat (created on first run) as an unattended background turn."""
+    chat = chat_store.get_chat(s["chat_id"]) if s.get("chat_id") else None
+    if chat is None:
+        project_id = s.get("project_id") if s.get("project_id") and project_store.get(s["project_id"]) else None
+        chat = chat_store.create_chat(project_id=project_id, name=s["name"], schedule_id=s["id"])
+    task_id, _ = _start_turn(chat["id"], s.get("model_id"), unattended=True, content=s["prompt"])
+    return chat["id"], task_id
+
+
+@app.get("/api/schedules")
+async def api_list_schedules() -> list[dict]:
+    return scheduler.list_schedules()
+
+
+@app.post("/api/schedules", status_code=201)
+async def api_create_schedule(req: ScheduleIn) -> dict:
+    try:
+        return scheduler.create(req.model_dump())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.patch("/api/schedules/{schedule_id}")
+async def api_update_schedule(schedule_id: str, req: ScheduleIn) -> dict:
+    try:
+        updated = scheduler.update(schedule_id, {k: v for k, v in req.model_dump().items() if k in req.model_fields_set})
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if updated is None:
+        raise HTTPException(404, "Schedule not found")
+    return updated
+
+
+@app.delete("/api/schedules/{schedule_id}", status_code=204, response_class=Response)
+async def api_delete_schedule(schedule_id: str) -> Response:
+    if not scheduler.delete(schedule_id):
+        raise HTTPException(404, "Schedule not found")
+    return Response(status_code=204)
+
+
+@app.post("/api/schedules/{schedule_id}/run")
+async def api_run_schedule(schedule_id: str) -> dict:
+    s = scheduler.get(schedule_id)
+    if s is None:
+        raise HTTPException(404, "Schedule not found")
+    chat_id, task_id = _start_scheduled_run(s)
+    scheduler.mark_run(schedule_id, chat_id, task_id)
+    return {"chat_id": chat_id, "task_id": task_id}
+
+
+# ── Voice input (/api/transcribe) ──────────────────────────────────────
+
+class TranscribeRequest(BaseModel):
+    audio_base64: str
+    mime: str | None = None
+
+
+_AUDIO_SUFFIX = {"audio/webm": ".webm", "audio/ogg": ".ogg", "audio/mp4": ".mp4", "audio/mpeg": ".mp3",
+                 "audio/wav": ".wav", "audio/x-wav": ".wav"}
+
+
+@app.post("/api/transcribe")
+async def api_transcribe(req: TranscribeRequest) -> dict:
+    if not transcribe.available():
+        raise HTTPException(503, "Voice input needs faster-whisper: pip install faster-whisper")
+    try:
+        audio = base64.b64decode(req.audio_base64.split(",", 1)[-1])
+    except Exception:
+        raise HTTPException(400, "audio_base64 is not valid base64")
+    if len(audio) > 25 * 1024 * 1024:
+        raise HTTPException(413, "Recording is too long")
+    suffix = _AUDIO_SUFFIX.get((req.mime or "").split(";")[0], ".webm")
+    try:
+        text = await run_in_threadpool(transcribe.transcribe, audio, suffix, _whisper_model)
+    except Exception as exc:
+        logger.warning("Transcription failed: %s", exc)
+        raise HTTPException(500, f"Transcription failed: {exc}")
+    return {"text": text}
+
+
+# ── Access token (/api/auth) ───────────────────────────────────────────
+
+class LoginRequest(BaseModel):
+    token: str
+
+
+@app.get("/api/auth/status")
+async def api_auth_status(request: Request) -> dict:
+    return {"required": bool(_ACCESS_TOKEN), "authenticated": _authorized(request)}
+
+
+@app.post("/api/auth/login")
+async def api_login(req: LoginRequest, request: Request) -> Response:
+    if not _ACCESS_TOKEN:
+        return JSONResponse({"ok": True})
+    if not _token_ok(req.token):
+        time.sleep(0.5)  # slow down guessing
+        raise HTTPException(401, "Wrong access token")
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(_AUTH_COOKIE, req.token, httponly=True, samesite="strict", max_age=60 * 60 * 24 * 30,
+                    secure=request.url.scheme == "https")
+    return resp
+
+
+@app.post("/api/auth/logout")
+async def api_logout() -> Response:
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(_AUTH_COOKIE)
+    return resp
 
 
 # ── OpenAI-compatible (/v1/*) ──────────────────────────────────────────
@@ -646,5 +1274,8 @@ def _sse_openai(req: ChatCompletionRequest, messages: list[dict], llm: LocalLLM)
 
 def run_server() -> None:
     cfg = load_config()
-    uvicorn.run(app, host=cfg["server"].get("host", "0.0.0.0"),
-                port=cfg["server"].get("port", 8000), log_level="warning")
+    host = cfg["server"].get("host", "127.0.0.1")
+    if host not in ("127.0.0.1", "localhost", "::1") and not _ACCESS_TOKEN:
+        logger.warning("Serving on %s without ACCESS_TOKEN: only requests addressed to localhost are accepted. "
+                       "Set ACCESS_TOKEN in backend/.env to use the app from other devices.", host)
+    uvicorn.run(app, host=host, port=cfg["server"].get("port", 8000), log_level="warning")

@@ -196,6 +196,32 @@ class TestAnthropicProvider:
             call_kwargs = mock_client.messages.stream.call_args.kwargs
             assert "system" not in call_kwargs
 
+    def test_stream_caches_conversation_prefix(self):
+        with patch("anthropic.Anthropic") as mock_cls:
+            from src.providers.anthropic_provider import AnthropicProvider
+            mock_client = mock_cls.return_value
+            mock_client.messages.stream.return_value = _make_stream_ctx(["ok"])
+            p = AnthropicProvider("test-key")
+            messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "a"},
+                        {"role": "assistant", "content": "b"}, {"role": "user", "content": "c"}]
+            list(p.stream(messages, "claude-haiku-5-5"))
+            sent = mock_client.messages.stream.call_args.kwargs["messages"]
+            assert sent[-1]["content"] == [{"type": "text", "text": "c", "cache_control": {"type": "ephemeral"}}]
+            assert all(isinstance(m["content"], str) for m in sent[:-1])
+            assert messages[-1]["content"] == "c"  # caller's list untouched
+
+    def test_complete_does_not_cache_conversation(self):
+        with patch("anthropic.Anthropic") as mock_cls:
+            from src.providers.anthropic_provider import AnthropicProvider
+            mock_client = mock_cls.return_value
+            p = AnthropicProvider("test-key")
+            try:
+                p.complete([{"role": "user", "content": "hi"}], "claude-haiku-5-5")
+            except Exception:
+                pass
+            sent = mock_client.messages.create.call_args.kwargs["messages"]
+            assert sent[-1]["content"] == "hi"
+
     def test_stream_with_image_injects_content_block(self):
         with patch("anthropic.Anthropic") as mock_cls:
             from src.providers.anthropic_provider import AnthropicProvider

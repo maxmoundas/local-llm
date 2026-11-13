@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
+import { filePreview, isPreviewableFile, usePreview } from '../lib/preview'
 import { formatCost, formatDuration, liveLine } from '../lib/turn'
 import type { AgentAction, InputRequest, SourceRef, TaskFile, Usage } from '../types'
 import {
   CheckIcon, ChevronDownIcon, CloseIcon, CloudIcon, CodeIcon, DownloadIcon, FileIcon, GlobeIcon, HandIcon,
-  NewsIcon, PageIcon, PlugIcon, QuestionIcon, SlashIcon,
+  EyeIcon, NewsIcon, PageIcon, PlugIcon, QuestionIcon, SlashIcon,
 } from './Icons'
 
 interface Props {
@@ -56,6 +57,7 @@ const SOURCE_PREVIEW = 8
 export default function Activity({
   actions, sources, files, taskId, active, status, pending, startedAt, elapsedMs, usage, onReply,
 }: Props) {
+  const openPreview = usePreview()
   // Open while working so each step animates in; fold away once the answer starts — unless the
   // user chose otherwise.
   const [userOpen, setUserOpen] = useState<boolean | null>(null)
@@ -99,12 +101,20 @@ export default function Activity({
           {files.length > 0 && taskId && (
             <div className="chips">
               {files.map(f => (
-                <a key={f.path} className="chip file-chip" href={api.taskFileUrl(taskId, f.path)} download>
-                  <FileIcon size={14} />
-                  <span className="chip-title">{f.path}</span>
-                  <span className="chip-meta">{formatSize(f.size)}</span>
-                  <DownloadIcon size={14} className="chip-action" />
-                </a>
+                <span key={f.path} className="chip-group">
+                  <a className="chip file-chip" href={api.taskFileUrl(taskId, f.path)} download>
+                    <FileIcon size={14} />
+                    <span className="chip-title">{f.path}</span>
+                    <span className="chip-meta">{formatSize(f.size)}</span>
+                    <DownloadIcon size={14} className="chip-action" />
+                  </a>
+                  {isPreviewableFile(f.path) && (
+                    <button className="chip chip-icon" title="Preview" aria-label={`Preview ${f.path}`}
+                            onClick={() => openPreview(filePreview(f.path, api.taskFileUrl(taskId, f.path)))}>
+                      <EyeIcon size={14} />
+                    </button>
+                  )}
+                </span>
               ))}
             </div>
           )}

@@ -189,8 +189,10 @@ class TestEndpoints:
         chat_id = test_client.post("/api/chats").json()["id"]
         assert test_client.post(f"/api/chats/{chat_id}/message", json={"content": "x"}).status_code == 409
 
-    def test_deleting_chat_removes_its_tasks(self, test_client):
+    def test_deleting_chat_detaches_its_tasks(self, test_client):
+        # Events go, but the task row stays (without the chat) so past spending still counts.
         chat_id = test_client.post("/api/chats").json()["id"]
         tid = test_client.post(f"/api/chats/{chat_id}/message", json={"content": "x"}).headers["x-task-id"]
         test_client.delete(f"/api/chats/{chat_id}")
-        assert store.get(tid) is None
+        assert store.get(tid)["chat_id"] is None
+        assert store.for_chat(chat_id) == []

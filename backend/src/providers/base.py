@@ -31,6 +31,10 @@ class ModelOption:
     max_output_tokens: int = 8_192
     input_price: float = 0.0   # $ per 1M input tokens
     output_price: float = 0.0  # $ per 1M output tokens
+    # Per-chat options the model accepts: a sampling temperature, and/or a reasoning-effort level
+    # (low | medium | high). Current Claude and GPT-5 models reject temperature but take effort.
+    temperature: bool = True
+    effort: bool = False
     # Provider-specific request fields (e.g. {"output_config": {"effort": "low"}}) and headers.
     extra_body: dict = field(default_factory=dict)
     extra_headers: dict = field(default_factory=dict)
@@ -39,7 +43,9 @@ class ModelOption:
         return {
             "id": self.id, "name": self.name, "provider": self.provider, "is_cheapest": self.is_cheapest,
             "tools": self.tools, "vision": self.vision, "context_window": self.context_window,
+            "max_output_tokens": self.max_output_tokens,
             "input_price": self.input_price, "output_price": self.output_price,
+            "temperature": self.temperature, "effort": self.effort,
         }
 
 
@@ -77,6 +83,43 @@ information, reply with {{"tool_calls": []}}."""
 REQUIRE_TOOL_NOTE = "\n\nYou must call at least one tool now."
 
 
+EFFORT_LEVELS = ("low", "medium", "high")
+
+
+def with_image(messages: list[dict], image_base64: str | None) -> list[dict]:
+    """Attach a single image (legacy `image_base64` argument) to the last user message.
+
+    Messages carry images in a neutral form — {"role": "user", "content": "text", "images": [b64, ...]} —
+    which each provider converts to its own content blocks.
+    """
+    if not image_base64:
+        return messages
+    msgs = [dict(m) for m in messages]
+    for m in reversed(msgs):
+        if m["role"] == "user":
+            m["images"] = [*(m.get("images") or []), image_base64]
+            break
+    return msgs
+
+
+def image_media_type(b64: str) -> str:
+    """Media type from the first bytes of a base64 image."""
+    import base64 as _b64
+    try:
+        head = _b64.b64decode(b64[:24] + "=" * (-len(b64[:24]) % 4))
+    except Exception:
+        return "image/jpeg"
+    if head[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if head[8:12] == b"WEBP":
+        return "image/webp"
+    if head[:4] == b"GIF8":
+        return "image/gif"
+    return "image/jpeg"
+
+
 def with_system_suffix(messages: list[dict], suffix: str) -> list[dict]:
     msgs = [dict(m) for m in messages]
     if msgs and msgs[0]["role"] == "system":
@@ -99,7 +142,11 @@ class BaseProvider(ABC):
     def models(self) -> list[ModelOption]: ...
 
     @abstractmethod
-    def stream(self, messages: list[dict], model_id: str, image_base64: str | None = None) -> Iterator[str]: ...
+    def stream(self, messages: list[dict], model_id: str, image_base64: str | None = None,
+               options: dict | None = None) -> Iterator[str]:
+        """Stream a reply. `options` carries per-chat settings: {"temperature": float, "effort": str}.
+        Each provider applies only what the model supports (see ModelOption.temperature / .effort)."""
+        ...
 
     @abstractmethod
     def complete(self, messages: list[dict], model_id: str) -> str:

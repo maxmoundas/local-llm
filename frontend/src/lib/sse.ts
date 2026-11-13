@@ -1,4 +1,4 @@
-import type { AgentAction, InputRequest, SourceRef, TaskFile, Usage } from '../types'
+import type { AgentAction, InputRequest, MemoryChange, SourceRef, TaskFile, Usage } from '../types'
 
 /** Events of one chat turn (a background task). Every event carries a `seq` for resuming. */
 export type StreamEvent = { seq?: number } & (
@@ -11,6 +11,7 @@ export type StreamEvent = { seq?: number } & (
   | { type: 'token'; content: string }
   | { type: 'blocked'; target: 'input' | 'output'; reason?: string }
   | { type: 'error'; message: string }
+  | ({ type: 'memory' } & MemoryChange)
   | { type: 'done'; name: string; files?: TaskFile[] }
   | ({ type: 'usage' } & Usage)
   | { type: 'task_end'; status: 'done' | 'failed' | 'cancelled' | 'interrupted' }

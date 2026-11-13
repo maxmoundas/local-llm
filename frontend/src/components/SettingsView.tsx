@@ -1,13 +1,17 @@
-import { useEffect, useState, type KeyboardEvent, type ReactNode } from 'react'
+import { useEffect, useState, type KeyboardEvent } from 'react'
+import { Row, Segmented, Toggle } from './controls'
+import UsageTab from './UsageTab'
 import { api } from '../api/client'
 import { getThemePref, setThemePref, type ThemePref } from '../lib/theme'
 import type { AppSettings } from '../types'
 
-type Editable = Omit<AppSettings, 'models' | 'jev_configured' | 'default_system_prompt' | 'default_guardrail_prompt' | 'sandbox_active' | 'connectors'>
-type Tab = 'general' | 'research' | 'jev' | 'safety' | 'memory' | 'models'
+type Editable = Omit<AppSettings, 'models' | 'jev_configured' | 'default_system_prompt' | 'default_guardrail_prompt'
+  | 'sandbox_active' | 'connectors' | 'transcription_available' | 'access_token_set'>
+type Tab = 'general' | 'usage' | 'research' | 'jev' | 'safety' | 'memory' | 'models'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'general', label: 'General' },
+  { id: 'usage', label: 'Usage' },
   { id: 'research', label: 'Agent' },
   { id: 'jev', label: 'Jev' },
   { id: 'safety', label: 'Safety' },
@@ -24,45 +28,9 @@ const SANDBOX_LABEL: Record<string, string> = { docker: 'Docker sandbox', local:
 function editable(s: AppSettings): Editable {
   const {
     models: _m, jev_configured: _j, default_system_prompt: _d, default_guardrail_prompt: _g,
-    sandbox_active: _sa, connectors: _c, ...rest
+    sandbox_active: _sa, connectors: _c, transcription_available: _t, access_token_set: _a, ...rest
   } = s
   return rest
-}
-
-function Toggle({ checked, onChange, disabled }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
-  return (
-    <label className={`toggle${disabled ? ' disabled' : ''}`}>
-      <input type="checkbox" checked={checked} disabled={disabled} onChange={e => onChange(e.target.checked)} />
-      <span className="toggle-track"><span className="toggle-thumb" /></span>
-    </label>
-  )
-}
-
-function Row({ name, hint, children, stacked }: { name: string; hint?: ReactNode; children: ReactNode; stacked?: boolean }) {
-  return (
-    <div className={`setting-row${stacked ? ' stacked' : ''}`}>
-      <div className="setting-label">
-        <span className="setting-name">{name}</span>
-        {hint && <span className="setting-hint">{hint}</span>}
-      </div>
-      <div className="setting-control">{children}</div>
-    </div>
-  )
-}
-
-function Segmented<T extends string>({ value, options, onChange }: {
-  value: T; options: { value: T; label: string }[]; onChange: (v: T) => void
-}) {
-  return (
-    <div className="segmented" role="radiogroup">
-      {options.map(o => (
-        <button key={o.value} role="radio" aria-checked={value === o.value}
-                className={value === o.value ? 'on' : ''} onClick={() => onChange(o.value)}>
-          {o.label}
-        </button>
-      ))}
-    </div>
-  )
 }
 
 export default function SettingsView({ onDisplayName }: { onDisplayName: (name: string) => void }) {
@@ -91,7 +59,11 @@ export default function SettingsView({ onDisplayName }: { onDisplayName: (name: 
 
   const save = async () => {
     setSaveState('saving')
-    const [updated] = await Promise.all([api.updateSettings(draft), api.updateMemory(memoryDraft)])
+    // Only write memory if it was edited here — it may have been updated in the background since load.
+    const [updated] = await Promise.all([
+      api.updateSettings(draft),
+      memoryDraft !== memory ? api.updateMemory(memoryDraft) : null,
+    ])
     const merged = { ...settings, ...updated }
     setSettings(merged)
     setDraft(editable(merged))
@@ -147,7 +119,24 @@ export default function SettingsView({ onDisplayName }: { onDisplayName: (name: 
                     <button className="link-btn" onClick={() => set('system_prompt', settings.default_system_prompt)}>Reset to default</button>
                   )}
                 </Row>
+                <Row name="Voice input" hint={settings.transcription_available
+                  ? 'Speech is transcribed on this machine with Whisper. Larger models are more accurate and slower; the first use downloads the model.'
+                  : <>Install <code>faster-whisper</code> in the backend (<code>pip install faster-whisper</code>) and restart to show the microphone button.</>}>
+                  <select className="select" value={draft.whisper_model} disabled={!settings.transcription_available}
+                          onChange={e => set('whisper_model', e.target.value as Editable['whisper_model'])}>
+                    {(['tiny', 'base', 'small', 'medium', 'large-v3'] as const).map(m => <option key={m} value={m}>{m}</option>)}
+                  </select>
+                </Row>
+                <Row name="Network access" hint={settings.access_token_set
+                  ? 'An access token is set: other devices can use the app after signing in with it (if the backend listens on your network).'
+                  : <>Only this computer can use the app. To allow other devices, set <code>ACCESS_TOKEN</code> in <code>backend/.env</code> and <code>server.host: 0.0.0.0</code> in <code>config.yaml</code>.</>}>
+                  <span className={`status-pill ${settings.access_token_set ? 'on' : 'off'}`}>{settings.access_token_set ? 'Token required' : 'This computer only'}</span>
+                </Row>
               </>)}
+
+              {tab === 'usage' && (
+                <UsageTab budget={draft.monthly_budget_usd} onBudget={v => set('monthly_budget_usd', v)} />
+              )}
 
               {tab === 'research' && (<>
                 <p className="settings-intro">
@@ -302,13 +291,14 @@ export default function SettingsView({ onDisplayName }: { onDisplayName: (name: 
                 <Row name="Memory" hint="Learn lasting facts about you from your messages and use them in future chats.">
                   <Toggle checked={draft.memory_enabled} onChange={v => set('memory_enabled', v)} />
                 </Row>
-                {draft.memory_enabled && (
-                  <Row stacked name="What I remember" hint="Edit freely — this is sent with every conversation.">
-                    <textarea className="text-area" rows={8} value={memoryDraft} onChange={e => setMemoryDraft(e.target.value)}
-                              placeholder="Nothing remembered yet." />
-                    {memoryDraft && <button className="link-btn" onClick={() => setMemoryDraft('')}>Clear memory</button>}
-                  </Row>
-                )}
+                <Row stacked name="What I remember"
+                     hint={draft.memory_enabled
+                       ? 'One fact per line. Edit freely — this is sent with every conversation.'
+                       : "Memory is off: these facts are kept but not sent to chats or updated. Clear them if you don't want them stored."}>
+                  <textarea className="text-area" rows={8} value={memoryDraft} onChange={e => setMemoryDraft(e.target.value)}
+                            placeholder="Nothing remembered yet." />
+                  {memoryDraft && <button className="link-btn" onClick={() => setMemoryDraft('')}>Clear memory</button>}
+                </Row>
               </>)}
 
               {tab === 'models' && (
