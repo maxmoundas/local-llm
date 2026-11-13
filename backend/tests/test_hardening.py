@@ -175,7 +175,10 @@ class TestServerFixes:
         login = test_client.post("/api/auth/login", json={"token": "s3cret"})
         assert login.cookies["llm_session"] != "s3cret"
         assert test_client.get("/api/chats").status_code == 200
-        test_client.cookies.set("llm_session", "s3cret")  # an old-style cookie no longer works
+        # An old-style cookie (the raw token) no longer works. Clear first: newer Starlette/httpx scope the
+        # login cookie to "testserver.local", so set() would add a second cookie instead of replacing it.
+        test_client.cookies.clear()
+        test_client.cookies.set("llm_session", "s3cret")
         assert test_client.get("/api/chats").status_code == 401
 
     def test_vision_rejects_bad_image(self, test_client, monkeypatch):
