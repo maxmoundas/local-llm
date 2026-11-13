@@ -104,6 +104,9 @@ def _summary(data: dict) -> dict:
     }
 
 
+search_index.summarize = _summary  # the index keeps each chat's summary for list_chats
+
+
 def _all() -> list[dict]:
     CHATS_DIR.mkdir(parents=True, exist_ok=True)
     out = []
@@ -121,7 +124,10 @@ def _all() -> list[dict]:
 
 
 def list_chats(project_id: str | None = None) -> list[dict]:
-    chats = [_summary(c) for c in _all()]
+    """Chat summaries, most recently changed first — from the index, or by reading every file without one."""
+    chats = search_index.summaries(CHATS_DIR)
+    if chats is None:
+        chats = [_summary(c) for c in _all()]
     return [c for c in chats if c["project_id"] == project_id] if project_id else chats
 
 

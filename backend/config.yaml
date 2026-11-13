@@ -1,7 +1,7 @@
 model:
   repo_id: "google/gemma-4-E4B-it"
   cache_dir: "../models"
-  # 4bit recommended for 31B on 12GB VRAM (CPU offload will handle overflow)
+  # 4bit: ~5 GB for Gemma 4 E4B (fits 8 GB VRAM); 8bit or none need more
   # options: none, 4bit, 8bit
   quantization: "4bit"
   # auto lets accelerate split across GPU + CPU RAM as needed

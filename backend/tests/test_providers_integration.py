@@ -32,7 +32,7 @@ _OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
 _SKIP_ANTHROPIC = pytest.mark.skipif(not _ANTHROPIC_KEY, reason="ANTHROPIC_API_KEY not set")
 _SKIP_OPENAI = pytest.mark.skipif(not _OPENAI_KEY, reason="OPENAI_API_KEY not set")
 
-_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+_ANTHROPIC_MODEL = "claude-haiku-5-5"
 _OPENAI_MODEL = "gpt-5.4-mini"
 
 _IMAGE_PATH = Path(__file__).parent / "images" / "smile.png"
@@ -194,7 +194,7 @@ class TestAnthropicConnection:
     def test_haiku_model_id(self):
         from src.providers.anthropic_provider import AnthropicProvider
         p = AnthropicProvider(_ANTHROPIC_KEY)
-        _, text = _stream_or_skip("Anthropic/Haiku", p, [{"role": "user", "content": "Say 'ok'"}], "claude-haiku-4-5-20251001")
+        _, text = _stream_or_skip("Anthropic/Haiku", p, [{"role": "user", "content": "Say 'ok'"}], "claude-haiku-5-5")
         assert len(text.strip()) > 0
 
     @_SKIP_ANTHROPIC
@@ -394,7 +394,7 @@ class TestRegistryAutoDiscovery:
     def test_registry_routes_anthropic_model(self, mock_llm):
         from src.providers.registry import build_registry
         registry = build_registry(mock_llm)
-        assert registry.get_provider("claude-haiku-4-5-20251001").provider_name == "anthropic"
+        assert registry.get_provider("claude-haiku-5-5").provider_name == "anthropic"
 
     @_SKIP_OPENAI
     def test_registry_routes_openai_model(self, mock_llm):

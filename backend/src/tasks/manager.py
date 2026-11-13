@@ -29,6 +29,10 @@ _UNPERSISTED = {"token"}
 TERMINAL = "task_end"
 
 
+class ChatBusy(Exception):
+    """start(..., exclusive=True) for a chat that already has a running task."""
+
+
 class Cancelled(Exception):
     """Raised inside a task when it is cancelled while waiting for the user."""
 
@@ -112,11 +116,18 @@ class TaskManager:
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
-    def start(self, chat_id: str | None, model_id: str | None, fn: Callable[[TaskContext], None]) -> str:
+    def start(self, chat_id: str | None, model_id: str | None, fn: Callable[[TaskContext], None],
+              exclusive: bool = False) -> str:
+        """Run fn in the background. With `exclusive`, raise ChatBusy if the chat already has a running
+        task — checked and registered under one lock, so two starts (e.g. a message and a scheduled
+        run on another thread) can't both get through."""
         self._sweep()
         task_id = uuid.uuid4().hex
         live = _Live(task_id, chat_id)
         with self._lock:
+            if exclusive and chat_id is not None and any(
+                    l.chat_id == chat_id and l.finished_at is None for l in self._live.values()):
+                raise ChatBusy(chat_id)
             self._live[task_id] = live
         store.create(task_id, chat_id, model_id)
         ctx = TaskContext(live, self)

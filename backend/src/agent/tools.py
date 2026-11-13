@@ -27,6 +27,8 @@ _log = get_logger(__name__)
 
 _HTTP_TIMEOUT = 12.0
 _PAGE_CHAR_LIMIT = 6000
+_MAX_PAGE_BYTES = 2 * 1024 * 1024  # read at most this much of any response
+_MAX_REDIRECTS = 5
 # Sites like Wikipedia reject generic or spoofed agents; a descriptive one with contact info is accepted.
 _USER_AGENT = f"LocalLLM-Research/1.0 (personal research assistant; +{os.getenv('RESEARCH_CONTACT', 'https://github.com/maxmoundas/local-llm')})"
 
@@ -167,35 +169,64 @@ def _html_to_text(html: str) -> tuple[str, str]:
     return title, text
 
 
-def _fetch_page(args: dict) -> ToolResult:
-    url = str(args.get("url", "")).strip()
+def _check_url(url: str) -> ToolResult | None:
+    """An error result if `url` isn't an http(s) URL on a public host, else None."""
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         return ToolResult(text=f"Error: not a web URL: {url}", summary="invalid URL")
     if not _is_public_host(parsed.hostname):
         return ToolResult(text=f"Error: refusing to fetch non-public host {parsed.hostname}", summary="blocked host")
+    return None
 
-    with httpx.Client(timeout=_HTTP_TIMEOUT, follow_redirects=True, headers={"User-Agent": _USER_AGENT}) as client:
-        resp = client.get(url)
-    final_host = resp.url.host
-    if final_host and final_host != parsed.hostname and not _is_public_host(final_host):
-        return ToolResult(text=f"Error: redirected to non-public host {final_host}", summary="blocked host")
-    if resp.status_code >= 400:
-        return ToolResult(text=f"Error: HTTP {resp.status_code} fetching {url}", summary=f"HTTP {resp.status_code}")
 
-    content_type = resp.headers.get("content-type", "")
-    if "html" in content_type:
-        title, text = _html_to_text(resp.text)
-    elif content_type.startswith("text/") or "json" in content_type:
-        title, text = "", resp.text
-    else:
-        return ToolResult(text=f"Error: unsupported content type {content_type}", summary="unsupported")
+def _read_capped(resp: httpx.Response, limit: int | None = None) -> bytes:
+    """The response body, stopping after `limit` bytes so a huge download can't exhaust memory."""
+    limit = limit or _MAX_PAGE_BYTES
+    buf = bytearray()
+    for chunk in resp.iter_bytes():
+        buf += chunk
+        if len(buf) >= limit:
+            break
+    return bytes(buf[:limit])
+
+
+def _fetch_page(args: dict) -> ToolResult:
+    url = str(args.get("url", "")).strip()
+    if problem := _check_url(url):
+        return problem
+
+    # Redirects are followed by hand so every hop is checked *before* it is requested — a public page
+    # must not be able to bounce the fetch to localhost, the LAN, or a cloud metadata address.
+    with httpx.Client(timeout=_HTTP_TIMEOUT, follow_redirects=False, headers={"User-Agent": _USER_AGENT}) as client:
+        current = url
+        for _ in range(_MAX_REDIRECTS + 1):
+            with client.stream("GET", current) as resp:
+                if resp.is_redirect and resp.next_request is not None:
+                    current = str(resp.next_request.url)
+                    if problem := _check_url(current):
+                        problem.text = problem.text.replace("Error: ", "Error: redirected — ", 1)
+                        return problem
+                    continue
+                if resp.status_code >= 400:
+                    return ToolResult(text=f"Error: HTTP {resp.status_code} fetching {url}",
+                                      summary=f"HTTP {resp.status_code}")
+                content_type = resp.headers.get("content-type", "")
+                is_html = "html" in content_type
+                if not (is_html or content_type.startswith("text/") or "json" in content_type):
+                    return ToolResult(text=f"Error: unsupported content type {content_type}", summary="unsupported")
+                body = _read_capped(resp).decode(resp.encoding or "utf-8", "replace")
+                resp_url = resp.url
+                break
+        else:
+            return ToolResult(text=f"Error: too many redirects fetching {url}", summary="too many redirects")
+
+    title, text = _html_to_text(body) if is_html and body.strip() else ("", body)
 
     truncated = len(text) > _PAGE_CHAR_LIMIT
     text = text[:_PAGE_CHAR_LIMIT] + ("\n[…truncated]" if truncated else "")
     return ToolResult(
-        text=f"Title: {title}\nURL: {resp.url}\n\n{text}",
-        sources=[Source(title=title or _domain(url), url=str(resp.url))],
+        text=f"Title: {title}\nURL: {resp_url}\n\n{text}",
+        sources=[Source(title=title or _domain(url), url=str(resp_url))],
         summary=f"{len(text):,} chars",
     )
 

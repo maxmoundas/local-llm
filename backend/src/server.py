@@ -32,6 +32,7 @@ Endpoints
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -73,7 +74,7 @@ from src.providers import ProviderRegistry, build_registry
 from src.providers.base import EFFORT_LEVELS
 from src.settings_store import DEFAULT_GUARDRAIL_PROMPT, DEFAULT_SYSTEM_PROMPT
 from src.tasks import store as task_store
-from src.tasks.manager import TaskManager
+from src.tasks.manager import ChatBusy, TaskManager
 from src.tasks.turn import TurnDeps, run_turn
 
 if TYPE_CHECKING:  # torch is only needed on the CUDA backend
@@ -277,12 +278,21 @@ def _token_ok(candidate: str | None) -> bool:
                                hashlib.sha256(_ACCESS_TOKEN.encode()).digest())
 
 
+def _session_value() -> str:
+    """What the sign-in cookie holds: derived from the token, so a leaked cookie doesn't reveal it."""
+    return hmac.new(_ACCESS_TOKEN.encode(), b"llm-session-v1", hashlib.sha256).hexdigest()
+
+
+def _session_ok(candidate: str | None) -> bool:
+    return bool(candidate) and hmac.compare_digest(candidate.encode(), _session_value().encode())
+
+
 def _authorized(request: Request) -> bool:
     if not _ACCESS_TOKEN:
         return True
     header = request.headers.get("authorization", "")
     bearer = header[7:].strip() if header.lower().startswith("bearer ") else None
-    return _token_ok(bearer) or _token_ok(request.cookies.get(_AUTH_COOKIE))
+    return _token_ok(bearer) or _session_ok(request.cookies.get(_AUTH_COOKIE))
 
 
 def _host_name(host_header: str) -> str:
@@ -480,7 +490,7 @@ class CreateChatRequest(BaseModel):
 
 @app.get("/api/chats")
 async def api_list_chats(project_id: str | None = None) -> list[dict]:
-    return chat_store.list_chats(project_id)
+    return await run_in_threadpool(chat_store.list_chats, project_id)
 
 
 @app.post("/api/chats", status_code=201)
@@ -714,8 +724,12 @@ def _start_turn(chat_id: str, model_id: str | None, unattended: bool = False, **
     deps = _turn_deps(svc, chat, unattended=unattended)
     content = turn_kwargs.pop("content", "")
     image_base64 = turn_kwargs.pop("image_base64", None)
-    task_id = _tasks.start(chat_id, model_id,
-                           lambda ctx: run_turn(ctx, chat_id, content, image_base64, model_id, deps, **turn_kwargs))
+    try:
+        task_id = _tasks.start(chat_id, model_id,
+                               lambda ctx: run_turn(ctx, chat_id, content, image_base64, model_id, deps, **turn_kwargs),
+                               exclusive=True)
+    except ChatBusy:
+        raise HTTPException(409, "This chat is still working on the previous message")
     return task_id, model_id
 
 
@@ -1024,7 +1038,7 @@ async def api_usage(days: int = 30) -> dict:
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     rows = await run_in_threadpool(task_store.usage_since, min(since, month_start).timestamp())
     names = {m.id: m.name for m in _registry.list_models()} if _registry else {}
-    chat_names = {c["id"]: c["name"] for c in chat_store.list_chats()}
+    chat_names = {c["id"]: c["name"] for c in await run_in_threadpool(chat_store.list_chats)}
 
     per_day = {(since + timedelta(days=i)).strftime("%Y-%m-%d"): {"cost_usd": 0.0, "input_tokens": 0,
                                                                    "output_tokens": 0, "turns": 0}
@@ -1230,10 +1244,10 @@ async def api_login(req: LoginRequest, request: Request) -> Response:
     if not _ACCESS_TOKEN:
         return JSONResponse({"ok": True})
     if not _token_ok(req.token):
-        time.sleep(0.5)  # slow down guessing
+        await asyncio.sleep(0.5)  # slow down guessing (without stalling other requests)
         raise HTTPException(401, "Wrong access token")
     resp = JSONResponse({"ok": True})
-    resp.set_cookie(_AUTH_COOKIE, req.token, httponly=True, samesite="strict", max_age=60 * 60 * 24 * 30,
+    resp.set_cookie(_AUTH_COOKIE, _session_value(), httponly=True, samesite="strict", max_age=60 * 60 * 24 * 30,
                     secure=request.url.scheme == "https")
     return resp
 
@@ -1308,12 +1322,14 @@ class VisionRequest(BaseModel):
 
 @app.post("/v1/vision")
 def vision_completion(req: VisionRequest) -> dict[str, str]:
-    import base64
     from io import BytesIO
     from PIL import Image as PILImage
     llm = _require_llm()
-    img_bytes = base64.b64decode(req.image_base64)
-    image = PILImage.open(BytesIO(img_bytes)).convert("RGB")
+    try:
+        img_bytes = base64.b64decode(req.image_base64.split(",", 1)[-1], validate=True)
+        image = PILImage.open(BytesIO(img_bytes)).convert("RGB")
+    except Exception:
+        raise HTTPException(400, "image_base64 must be a base64-encoded PNG, JPEG, GIF, or WebP image")
     response = llm.generate_with_image(image, req.prompt, req.max_new_tokens)
     logger.info("Vision request complete | response=%s", response[:120])
     return {"response": response}
@@ -1368,10 +1384,12 @@ async def chat_completions(req: ChatCompletionRequest) -> Any:
             headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
         )
 
-    completion = llm.generate(messages, max_new_tokens=req.max_tokens,
-                              temperature=req.temperature, top_p=req.top_p)
-    prompt_tokens = sum(llm.count_tokens(m["content"]) for m in messages)
-    completion_tokens = llm.count_tokens(completion)
+    # Generation takes seconds to minutes; on the event loop it would stall every other request.
+    def generate() -> tuple[str, int, int]:
+        text = llm.generate(messages, max_new_tokens=req.max_tokens, temperature=req.temperature, top_p=req.top_p)
+        return text, sum(llm.count_tokens(m["content"]) for m in messages), llm.count_tokens(text)
+
+    completion, prompt_tokens, completion_tokens = await run_in_threadpool(generate)
 
     return ChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
