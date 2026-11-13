@@ -13,8 +13,12 @@ from src.guardrail_service import GuardrailService
 from src.llm_service import LLMService
 
 
+_RUNTIME = {"task_start", "usage", "task_end"}  # emitted by the task manager around every turn
+
+
 def _parse_sse(text: str) -> list[dict]:
-    return [json.loads(line[6:]) for line in text.split("\n") if line.startswith("data: ")]
+    events = [json.loads(line[6:]) for line in text.split("\n") if line.startswith("data: ")]
+    return [e for e in events if e["type"] not in _RUNTIME]
 
 
 @pytest.fixture(autouse=True)
@@ -44,12 +48,14 @@ def _research_stubs(research: bool = True):
     router = MagicMock(spec=ResearchRouter)
     router.decide.return_value = RouteDecision(research=research, probability=0.9)
     agent = MagicMock(spec=ResearchAgent)
+    act = {"id": "a1", "tool": "web_search", "kind": "search", "label": "Searching the web for “x”",
+           "status": "running", "summary": ""}
+    done = {**act, "status": "done", "label": "Searched the web for “x”", "summary": "3 results"}
     agent.run.return_value = iter([
-        AgentEvent("status", "Planning research"),
-        AgentEvent("status", "Searching the web for “x”"),
-        AgentEvent("step", step={"tool": "web_search", "label": "Searched the web for “x”", "summary": "3 results"}),
-        AgentEvent("done", notes="NOTES", sources=[{"title": "A", "url": "https://a.com"}],
-                   steps=[{"tool": "web_search", "label": "Searched the web for “x”", "summary": "3 results"}]),
+        AgentEvent("status", "Thinking"),
+        AgentEvent("action", action=act),
+        AgentEvent("action", action=done),
+        AgentEvent("done", notes="NOTES", sources=[{"title": "A", "url": "https://a.com"}], actions=[done]),
     ])
     return router, agent
 
@@ -66,7 +72,8 @@ class TestResearchPath:
         server._router, server._agent = _research_stubs()
         _, events = _send(test_client)
         types = [e["type"] for e in events]
-        assert types[:3] == ["status", "status", "step"]
+        assert types[:4] == ["status", "status", "action", "action"]
+        assert [e["action"]["status"] for e in events if e["type"] == "action"] == ["running", "done"]
         assert "sources" in types
         assert types.index("sources") < types.index("token")
         assert types[-1] == "done"
@@ -77,7 +84,8 @@ class TestResearchPath:
         chat_id, _ = _send(test_client)
         reply = test_client.get(f"/api/chats/{chat_id}").json()["messages"][-1]
         assert reply["role"] == "assistant" and reply["content"] == "hello world"
-        assert reply["steps"][0]["tool"] == "web_search"
+        assert reply["actions"][0]["tool"] == "web_search"
+        assert reply["task_id"] and reply["usage"]["calls"] >= 1
         assert reply["sources"][0]["url"] == "https://a.com"
 
     def test_notes_added_to_system_prompt(self, test_client, monkeypatch):
@@ -92,13 +100,13 @@ class TestResearchPath:
 
         monkeypatch.setattr(LLMService, "stream", spy)
         _send(test_client)
-        assert "<research_notes>\nNOTES\n</research_notes>" in seen["system"]
+        assert "<work_log>\nNOTES\n</work_log>" in seen["system"]
 
     def test_router_says_no_skips_agent(self, test_client):
         from src import server
         server._router, server._agent = _research_stubs(research=False)
         _, events = _send(test_client)
-        assert not any(e["type"] in ("status", "step") for e in events)
+        assert not any(e["type"] == "action" for e in events)
         server._agent.run.assert_not_called()
 
     def test_images_skip_research(self, test_client):
@@ -115,40 +123,50 @@ class TestResearchPath:
 
 
 class TestStopGeneration:
-    def test_closing_mid_answer_saves_partial_reply(self, test_client):
+    def test_cancel_mid_answer_saves_partial_reply(self, test_client, monkeypatch):
+        # TestClient buffers streamed bodies, so drive the task manager directly.
+        import threading
+        from src import chat_store, server
+        from src.model import LocalLLM
+        from src.tasks.turn import run_turn
+        server._router = server._agent = None
+        release = threading.Event()
+
+        def slow_stream(self, *a, **kw):
+            yield "hello "
+            release.wait(5)
+            yield "world"
+
+        monkeypatch.setattr(LocalLLM, "stream", slow_stream)
+        chat_id = test_client.post("/api/chats").json()["id"]
+        model = server._registry.default_model_id
+        deps = server._turn_deps(server._llm_service)
+        task_id = server._tasks.start(chat_id, model, lambda ctx: run_turn(ctx, chat_id, "hi", None, model, deps))
+        statuses = []
+        for evt in server._tasks.subscribe(task_id):
+            if evt["type"] == "token" and not statuses:
+                statuses.append(test_client.post(f"/api/tasks/{task_id}/cancel").json()["cancelled"])
+                release.set()
+            if evt["type"] == "task_end":
+                statuses.append(evt["status"])
+        assert statuses == [True, "cancelled"]
+        reply = chat_store.get_chat(chat_id)["messages"][-1]
+        assert reply["role"] == "assistant" and reply["stopped"] is True
+        assert reply["content"].startswith("hello")
+
+    def test_disconnect_does_not_stop_the_task(self, test_client):
+        import time
         from src import chat_store, server
         server._router = server._agent = None
         chat_id = test_client.post("/api/chats").json()["id"]
-        gen = server._sse_generator(chat_id, server.MessageRequest(content="hi"), server._registry.default_model_id,
-                                    server._llm_service)
-        first = next(gen)
-        assert '"token"' in first
-        gen.close()  # what _close_on_disconnect does when the client stops
-        reply = chat_store.get_chat(chat_id)["messages"][-1]
-        assert reply == {"role": "assistant", "content": "hello ", "stopped": True}
-
-    def test_close_when_idle_retries_until_generator_free(self):
-        import threading
-        import time
-        from src import server
-        started, release = threading.Event(), threading.Event()
-
-        def slow():
-            started.set()
-            release.wait()
-            yield "a"
-            yield "b"
-
-        gen = slow()
-        threading.Thread(target=lambda: next(gen), daemon=True).start()
-        started.wait()
-        closer = threading.Thread(target=server._close_when_idle, args=(gen,))
-        closer.start()
-        time.sleep(0.1)
-        release.set()
-        closer.join(timeout=2)
-        assert not closer.is_alive()
-        assert gen.gi_frame is None  # closed
+        with test_client.stream("POST", f"/api/chats/{chat_id}/message", json={"content": "hi"}) as resp:
+            task_id = resp.headers["x-task-id"]
+            next(resp.iter_lines())  # read one event, then drop the connection
+        for _ in range(100):
+            if test_client.get(f"/api/tasks/{task_id}").json()["status"] == "done":
+                break
+            time.sleep(0.02)
+        assert chat_store.get_chat(chat_id)["messages"][-1]["content"] == "hello world"
 
 
 class TestBuildMessages:

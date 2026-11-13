@@ -16,6 +16,9 @@ openai>=1.50.0
 ddgs>=9.0
 lxml>=5.0
 
+# Connectors: MCP servers (email, calendar, GitHub…) configured in connectors.yaml
+mcp>=1.10
+
 # Server
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0

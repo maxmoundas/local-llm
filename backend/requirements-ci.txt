@@ -1,0 +1,18 @@
+# Unit tests only — no GPU stack. CPU torch keeps the CUDA-backend tests runnable.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.1.0
+transformers>=4.47.0
+Pillow>=10.0.0
+anthropic>=0.40.0
+openai>=1.50.0
+ddgs>=9.0
+mcp>=1.10
+lxml>=5.0
+fastapi>=0.115.0
+uvicorn>=0.32.0
+pydantic>=2.0.0
+pyyaml>=6.0
+python-dotenv>=1.0.0
+httpx>=0.27.0
+pytest>=8.0.0
+pytest-asyncio>=0.24.0

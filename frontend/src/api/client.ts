@@ -1,4 +1,4 @@
-import type { AppSettings, Chat, ChatDetail, HealthStatus, MemoryData, ModelOption } from '../types'
+import type { AppSettings, Chat, ChatDetail, HealthStatus, InputRequest, MemoryData, ModelOption } from '../types'
 
 // All paths are relative — Vite proxies /api/* and /health to :8000 in dev.
 // In a built+served-from-FastAPI setup they hit the same origin.
@@ -41,10 +41,31 @@ export const api = {
       signal,
     }),
 
+  /** The task still running for a chat (to reattach after a reload), or null. */
+  activeTask: (chatId: string): Promise<{ task_id: string; pending: InputRequest | null } | null> =>
+    fetch(`/api/chats/${chatId}/active`).then(r => (r.ok ? r.json() : null)),
+
+  /** Resume a task's event stream after `after` (the last seq seen). */
+  taskEvents: (taskId: string, after: number, signal?: AbortSignal): Promise<Response> =>
+    fetch(`/api/tasks/${taskId}/events?after=${after}`, { signal }),
+
+  cancelTask: (taskId: string): Promise<{ cancelled: boolean }> =>
+    fetch(`/api/tasks/${taskId}/cancel`, { method: 'POST' }).then(r => r.json()),
+
+  replyTask: (taskId: string, reply: { request_id: string; answer?: string; approved?: boolean }): Promise<boolean> =>
+    fetch(`/api/tasks/${taskId}/reply`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(reply),
+    }).then(r => r.ok),
+
+  taskFileUrl: (taskId: string, path: string): string =>
+    `/api/tasks/${taskId}/files/${path.split('/').map(encodeURIComponent).join('/')}`,
+
   getSettings: (): Promise<AppSettings> =>
     fetch('/api/settings').then(r => r.json()),
 
-  updateSettings: (data: Partial<Omit<AppSettings, 'models' | 'jev_configured'>>): Promise<AppSettings> =>
+  updateSettings: (data: Partial<Omit<AppSettings, 'models' | 'jev_configured' | 'sandbox_active' | 'connectors'>>): Promise<AppSettings> =>
     fetch('/api/settings', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },

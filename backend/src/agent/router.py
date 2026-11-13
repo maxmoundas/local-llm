@@ -7,6 +7,7 @@ research prompts scored 0.82–0.98 and non-research prompts 0.02–0.07.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -25,12 +26,15 @@ _ASSISTANT_DESCRIPTION = (
     "An AI assistant with a fixed training cutoff. It has no live data unless it uses "
     "web search, news, weather, and page-fetch tools."
 )
+_CODE_CAPABILITY = (" It can also run code in a sandbox to calculate exactly, analyze data, test programs, "
+                    "and create files for the user.")
 
 _NEEDS_RESEARCH = noul(
-    "Answering the latest message well requires looking up current, recent, local, or specific external "
-    "information (news, weather, prices, scores, recent releases, live status, or the contents of a URL) "
-    "that an offline AI assistant would not reliably know from its training data.",
-    true="Needs fresh or external information gathered from the web or live data sources.",
+    "Handling the latest message well requires the assistant to use its tools: looking up current, recent, "
+    "local, or specific external information (news, weather, prices, scores, recent releases, live status, or "
+    "the contents of a URL), running code for exact calculations, data work, or files, or acting on one of its "
+    "connected services — rather than answering from its training data alone.",
+    true="Needs tools: fresh or external information, running code or producing files, or a connected service.",
     false="Can be fully answered from general knowledge, reasoning, writing, or coding skill alone.",
 )
 
@@ -42,8 +46,8 @@ _HAS_ENOUGH = noul(
 )
 
 _LLM_ROUTE_PROMPT = (
-    "Decide if an AI assistant must search the web or use live data (news, weather, prices, recent "
-    "events, a specific URL) to answer the user's latest message well. Today is {today}. "
+    "Decide if an AI assistant must use tools to handle the user's latest message well: search the web or "
+    "use live data (news, weather, prices, recent events, a specific URL){extra}. Today is {today}. "
     "Reply with ONLY 'yes' or 'no'."
 )
 
@@ -64,11 +68,34 @@ def _recent(history: list[dict], limit: int = 4, chars: int = 500) -> list[dict]
     return [{"role": m["role"], "content": str(m.get("content", ""))[:chars]} for m in turns]
 
 
+def _first_yes_no(raw: str) -> bool:
+    """True when the first yes/no word in the reply is 'yes' (tolerates 'Yes.', '**Yes**', 'Answer: yes')."""
+    m = re.search(r"\b(yes|no)\b", raw.lower())
+    return bool(m and m.group(1) == "yes")
+
+
 class ResearchRouter:
-    def __init__(self, llm: LLMService, decisions: DecisionService | None, use_jev: bool = True) -> None:
+    def __init__(self, llm: LLMService, decisions: DecisionService | None, use_jev: bool = True,
+                 can_run_code: bool = False, connectors: list[str] | None = None) -> None:
         self._llm = llm
         self._decisions = decisions
         self._use_jev = use_jev
+        self._code = can_run_code
+        self._connectors = list(connectors or [])
+
+    def _description(self) -> str:
+        text = _ASSISTANT_DESCRIPTION + (_CODE_CAPABILITY if self._code else "")
+        if self._connectors:
+            text += f" Connected services it can use: {', '.join(self._connectors)}."
+        return text
+
+    def _llm_extra(self) -> str:
+        extra = ""
+        if self._code:
+            extra += ", run code for exact calculations, data analysis, or to create files"
+        if self._connectors:
+            extra += f", or use a connected service ({', '.join(self._connectors)})"
+        return extra
 
     @property
     def _jev(self) -> DecisionService | None:
@@ -81,7 +108,7 @@ class ResearchRouter:
         if jev := self._jev:
             state = {
                 "today": _today(),
-                "assistant": _ASSISTANT_DESCRIPTION,
+                "assistant": self._description(),
                 "recent_conversation": _recent(history),
                 "latest_message": latest[:2000],
             }
@@ -91,13 +118,16 @@ class ResearchRouter:
             except DecisionError:
                 pass  # fall through to the LLM
 
+        # The message is wrapped as data with the question after it: small models otherwise
+        # just answer the message instead of classifying it.
         messages = [
-            {"role": "system", "content": _LLM_ROUTE_PROMPT.format(today=_today())},
-            {"role": "user", "content": latest[:2000]},
+            {"role": "system", "content": _LLM_ROUTE_PROMPT.format(today=_today(), extra=self._llm_extra())},
+            {"role": "user", "content": f"<message>\n{latest[:2000]}\n</message>\n\n"
+                                        "Does handling this message need tools? Answer only yes or no."},
         ]
         try:
             raw = self._llm.complete(messages, call_type=LLM_CALL_TYPE_ROUTE, max_tokens=5)
-            return RouteDecision(research=raw.strip().lower().startswith("yes"), source="llm")
+            return RouteDecision(research=_first_yes_no(raw), source="llm")
         except Exception as exc:
             _log.warning("Research routing failed, answering directly: %s", exc)
             return RouteDecision(research=False, source="llm")

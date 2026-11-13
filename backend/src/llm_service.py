@@ -29,6 +29,7 @@ CALL_TYPE_MEMORY = "memory_update"    # extracting durable user facts
 CALL_TYPE_GUARD  = "guardrail_check"  # content safety classification
 CALL_TYPE_AGENT  = "agent_step"       # one tool-selection turn in the research loop
 CALL_TYPE_ROUTE  = "research_routing" # LLM fallback when Jev is unavailable
+CALL_TYPE_COMPACT = "agent_compaction" # summarizing old work-log entries in long tasks
 
 
 def _short(model_id: str) -> str:
@@ -166,6 +167,10 @@ class LLMService:
         _log.info("[%s] done  | %smodel=%s | calls=%s | %.1fs", call_type, ctx, _short(model_id),
                   [c.name for c in turn.tool_calls], time.monotonic() - t0)
         return turn
+
+    def model_info(self, model_id: str):
+        """The catalog entry (capabilities, context window, prices) for model_id."""
+        return self._registry.get_model(model_id)
 
     def count_tokens(self, model_id: str, text: str) -> int:
         """Estimate token count via the provider for model_id."""

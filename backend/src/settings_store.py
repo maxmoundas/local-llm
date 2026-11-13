@@ -43,9 +43,14 @@ _DEFAULTS: dict = {
     "guardrails_prompt": DEFAULT_GUARDRAIL_PROMPT,  # LLM fallback engine only
     "guardrails_topics": [],    # extra denied topics (empty = general safety only)
     "guardrails_policy": "strict",  # Jev thresholds: strict | permissive
-    # Research (multi-step web research, chosen per message by the router)
+    # Agent (research, code, connectors — chosen per message by the router; runs in the background)
     "agent_enabled": True,
-    "agent_max_steps": 4,       # planner turns per message; each turn may run several tools
+    "agent_max_steps": 12,      # planner turns per message; each turn may run several tools
+    "agent_model_id": None,     # model for agent steps; None → the chat's model. A cheap model here saves a lot.
+    "task_budget_usd": 0.50,    # stop a task's tool loop once it has spent this much (0/None = no limit)
+    "task_max_minutes": 20,     # wall-clock limit for the tool loop (0/None = no limit)
+    "code_execution": "auto",   # auto (Docker if available) | docker | local (unsandboxed!) | off
+    "sandbox_network": True,    # let sandboxed code reach the internet (pip install, APIs)
     # Jev (TypeSafe System One) — fast structured decisions. Each use can be turned off;
     # when off (or Jev is unreachable) that feature falls back to the cheapest LLM.
     "jev_enabled": True,

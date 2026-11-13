@@ -153,8 +153,8 @@ class TestAnthropicProvider:
             from src.providers.anthropic_provider import AnthropicProvider
             p = AnthropicProvider("test-key")
             ids = [m.id for m in p.models]
-            assert "claude-haiku-4-5-20251001" in ids
-            assert "claude-sonnet-4-6" in ids
+            assert "claude-haiku-5-5" in ids
+            assert "claude-sonnet-5-5" in ids
             # assert "claude-opus-4-7" in ids  # expensive — uncomment when re-enabling
 
     def test_all_models_have_anthropic_provider(self):
@@ -168,7 +168,7 @@ class TestAnthropicProvider:
             from src.providers.anthropic_provider import AnthropicProvider
             mock_cls.return_value.messages.stream.return_value = _make_stream_ctx(["Hello", " world"])
             p = AnthropicProvider("test-key")
-            tokens = list(p.stream([{"role": "user", "content": "hi"}], "claude-haiku-4-5-20251001"))
+            tokens = list(p.stream([{"role": "user", "content": "hi"}], "claude-haiku-5-5"))
             assert tokens == ["Hello", " world"]
 
     def test_stream_separates_system_message(self):
@@ -181,9 +181,9 @@ class TestAnthropicProvider:
                 {"role": "system", "content": "Be brief."},
                 {"role": "user", "content": "hello"},
             ]
-            list(p.stream(messages, "claude-haiku-4-5-20251001"))
+            list(p.stream(messages, "claude-haiku-5-5"))
             call_kwargs = mock_client.messages.stream.call_args.kwargs
-            assert call_kwargs["system"] == "Be brief."
+            assert call_kwargs["system"][0]["text"] == "Be brief."
             assert all(m["role"] != "system" for m in call_kwargs["messages"])
 
     def test_stream_without_system_message(self):
@@ -192,7 +192,7 @@ class TestAnthropicProvider:
             mock_client = mock_cls.return_value
             mock_client.messages.stream.return_value = _make_stream_ctx(["ok"])
             p = AnthropicProvider("test-key")
-            list(p.stream([{"role": "user", "content": "hi"}], "claude-haiku-4-5-20251001"))
+            list(p.stream([{"role": "user", "content": "hi"}], "claude-haiku-5-5"))
             call_kwargs = mock_client.messages.stream.call_args.kwargs
             assert "system" not in call_kwargs
 
@@ -204,7 +204,7 @@ class TestAnthropicProvider:
             p = AnthropicProvider("test-key")
             img_b64 = base64.b64encode(b"\xff\xd8\xff" + b"\x00" * 16).decode()
             messages = [{"role": "user", "content": "what is this?"}]
-            list(p.stream(messages, "claude-haiku-4-5-20251001", image_base64=img_b64))
+            list(p.stream(messages, "claude-haiku-5-5", image_base64=img_b64))
             call_kwargs = mock_client.messages.stream.call_args.kwargs
             last_msg = call_kwargs["messages"][-1]
             assert isinstance(last_msg["content"], list)
@@ -219,7 +219,7 @@ class TestAnthropicProvider:
             mock_client.messages.stream.return_value = _make_stream_ctx(["ok"])
             p = AnthropicProvider("test-key")
             jpeg_b64 = base64.b64encode(b"\xff\xd8\xff" + b"\x00" * 16).decode()
-            list(p.stream([{"role": "user", "content": "hi"}], "claude-haiku-4-5-20251001", image_base64=jpeg_b64))
+            list(p.stream([{"role": "user", "content": "hi"}], "claude-haiku-5-5", image_base64=jpeg_b64))
             call_kwargs = mock_client.messages.stream.call_args.kwargs
             img_block = next(b for b in call_kwargs["messages"][-1]["content"] if b["type"] == "image")
             assert img_block["source"]["media_type"] == "image/jpeg"
@@ -231,7 +231,7 @@ class TestAnthropicProvider:
             mock_client.messages.stream.return_value = _make_stream_ctx(["ok"])
             p = AnthropicProvider("test-key")
             png_b64 = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16).decode()
-            list(p.stream([{"role": "user", "content": "hi"}], "claude-haiku-4-5-20251001", image_base64=png_b64))
+            list(p.stream([{"role": "user", "content": "hi"}], "claude-haiku-5-5", image_base64=png_b64))
             call_kwargs = mock_client.messages.stream.call_args.kwargs
             img_block = next(b for b in call_kwargs["messages"][-1]["content"] if b["type"] == "image")
             assert img_block["source"]["media_type"] == "image/png"
@@ -257,7 +257,7 @@ class TestAnthropicProvider:
             mock_msg.content = [MagicMock(type="text", text="Short answer")]
             mock_cls.return_value.messages.create.return_value = mock_msg
             p = AnthropicProvider("test-key")
-            result = p.complete([{"role": "user", "content": "hi"}], "claude-haiku-4-5-20251001")
+            result = p.complete([{"role": "user", "content": "hi"}], "claude-haiku-5-5")
             assert result == "Short answer"
 
     def test_complete_separates_system_message(self):
@@ -271,9 +271,9 @@ class TestAnthropicProvider:
                 {"role": "system", "content": "Be brief."},
                 {"role": "user", "content": "hello"},
             ]
-            p.complete(messages, "claude-haiku-4-5-20251001")
+            p.complete(messages, "claude-haiku-5-5")
             call_kwargs = mock_cls.return_value.messages.create.call_args.kwargs
-            assert call_kwargs["system"] == "Be brief."
+            assert call_kwargs["system"][0]["text"] == "Be brief."
             assert all(m["role"] != "system" for m in call_kwargs["messages"])
 
     def test_complete_uses_non_streaming_api(self):
@@ -283,7 +283,7 @@ class TestAnthropicProvider:
             mock_msg.content = [MagicMock(text="ok")]
             mock_cls.return_value.messages.create.return_value = mock_msg
             p = AnthropicProvider("test-key")
-            p.complete([{"role": "user", "content": "hi"}], "claude-haiku-4-5-20251001")
+            p.complete([{"role": "user", "content": "hi"}], "claude-haiku-5-5")
             # create() not stream() should be called
             mock_cls.return_value.messages.create.assert_called_once()
             mock_cls.return_value.messages.stream.assert_not_called()
@@ -292,7 +292,7 @@ class TestAnthropicProvider:
         with patch("anthropic.Anthropic") as mock_cls:
             from src.providers.anthropic_provider import AnthropicProvider
             AnthropicProvider("my-secret-key")
-            mock_cls.assert_called_once_with(api_key="my-secret-key")
+            assert mock_cls.call_args.kwargs["api_key"] == "my-secret-key"
 
 
 # ── OpenAIProvider ─────────────────────────────────────────────────────
@@ -415,7 +415,7 @@ class TestOpenAIProvider:
         with patch("src.providers.openai_provider.OpenAI") as mock_cls:
             from src.providers.openai_provider import OpenAIProvider
             OpenAIProvider("my-secret-key")
-            mock_cls.assert_called_once_with(api_key="my-secret-key")
+            assert mock_cls.call_args.kwargs["api_key"] == "my-secret-key"
 
 
 # ── ProviderRegistry ───────────────────────────────────────────────────
@@ -502,39 +502,44 @@ class TestProviderRegistry:
 # ── build_registry ─────────────────────────────────────────────────────
 
 class TestBuildRegistry:
-    def test_always_includes_local(self, mock_llm):
+    def test_always_includes_local(self, mock_llm, tmp_path):
         from src.providers.registry import build_registry
-        with patch.dict("os.environ", {}, clear=False):
-            registry = build_registry(mock_llm)
+        cat = tmp_path / "m.yaml"
+        cat.write_text("providers:\n  local: {type: builtin}\n")
+        registry = build_registry(mock_llm, cat)
         providers = {m.provider for m in registry.list_models()}
         assert "local" in providers
 
-    def test_anthropic_registered_when_key_present(self, mock_llm):
+    def test_anthropic_registered_when_key_present(self, mock_llm, tmp_path):
         from src.providers.registry import build_registry
-        env = {"ANTHROPIC_API_KEY": "sk-ant-test", "OPENAI_API_KEY": ""}
-        # patch in the source module since build_registry uses a lazy `from ... import`
-        with patch.dict("os.environ", env):
-            with patch("src.providers.anthropic_provider.AnthropicProvider") as mock_cls:
-                mock_cls.return_value.models = [ModelOption(id="x", name="x", provider="anthropic")]
-                mock_cls.return_value.provider_name = "anthropic"
-                build_registry(mock_llm)
-                mock_cls.assert_called_once_with("sk-ant-test")
+        cat = tmp_path / "m.yaml"
+        cat.write_text("providers:\n  anthropic:\n    type: anthropic\n    api_key_env: ANTHROPIC_API_KEY\n"
+                       "    models: [{id: claude-haiku-5-5, input_price: 0.1, output_price: 0.5}]\n")
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-ant-test"}), patch("anthropic.Anthropic") as cls:
+            registry = build_registry(mock_llm, cat)
+            cls.assert_called_once_with(api_key="sk-ant-test")
+        assert registry.get_model("claude-haiku-5-5").input_price == 0.1
 
-    def test_openai_registered_when_key_present(self, mock_llm):
+    def test_openai_registered_when_key_present(self, mock_llm, tmp_path):
         from src.providers.registry import build_registry
-        env = {"ANTHROPIC_API_KEY": "", "OPENAI_API_KEY": "sk-openai-test"}
-        with patch.dict("os.environ", env):
-            with patch("src.providers.openai_provider.OpenAIProvider") as mock_cls:
-                mock_cls.return_value.models = [ModelOption(id="y", name="y", provider="openai")]
-                mock_cls.return_value.provider_name = "openai"
-                build_registry(mock_llm)
-                mock_cls.assert_called_once_with("sk-openai-test")
+        cat = tmp_path / "m.yaml"
+        cat.write_text("providers:\n  openai:\n    type: openai\n    api_key_env: OPENAI_API_KEY\n"
+                       "    models: [gpt-5.4-mini]\n")
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "sk-openai-test"}), \
+                patch("src.providers.openai_provider.OpenAI") as cls:
+            registry = build_registry(mock_llm, cat)
+            assert cls.call_args.kwargs["api_key"] == "sk-openai-test"
+        assert registry.get_provider("gpt-5.4-mini").provider_name == "openai"
 
-    def test_cloud_providers_not_registered_without_keys(self, mock_llm):
+    def test_cloud_providers_not_registered_without_keys(self, mock_llm, tmp_path):
         from src.providers.registry import build_registry
+        cat = tmp_path / "m.yaml"
+        cat.write_text("providers:\n  local: {type: builtin}\n"
+                       "  anthropic: {type: anthropic, api_key_env: ANTHROPIC_API_KEY, models: [a]}\n"
+                       "  openai: {type: openai, api_key_env: OPENAI_API_KEY, models: [b]}\n")
         env = {"ANTHROPIC_API_KEY": "", "OPENAI_API_KEY": ""}
         with patch.dict("os.environ", env):
-            registry = build_registry(mock_llm)
+            registry = build_registry(mock_llm, cat)
         providers = {m.provider for m in registry.list_models()}
         assert "anthropic" not in providers
         assert "openai" not in providers
@@ -646,3 +651,19 @@ class TestCheapestModelReadiness:
         registry.register(self._provider("local", "gemma", ready=False))
         registry.register(self._provider("anthropic", "haiku", ready=True))
         assert LLMService(registry, cheapest_model_id="gemma")._resolve_cheapest_id() == "haiku"
+
+
+class TestCheapestFallback:
+    def test_uses_cheapest_ready_model_when_flagged_ones_are_not_ready(self):
+        from src.providers.registry import ProviderRegistry
+        from tests.fakes import ScriptedProvider
+
+        class NotReady(ScriptedProvider):
+            ready = False
+
+        reg = ProviderRegistry()
+        reg.register(NotReady(model_id="local-loading"))
+        free = ScriptedProvider(model_id="ollama-model", price=(0.0, 0.0))
+        free.models[0].is_cheapest = False
+        reg.register(free)
+        assert reg.cheapest_model.id == "ollama-model"

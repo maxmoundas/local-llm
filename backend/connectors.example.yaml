@@ -1,0 +1,29 @@
+# Connectors — MCP servers the agent can use as tools.
+# Copy to connectors.yaml (git-ignored) and restart the backend.
+# Any MCP server works: https://github.com/modelcontextprotocol/servers
+#
+#   command/args/env   start a local server over stdio (env values expand ${VARS} from backend/.env)
+#   url/headers        connect to a remote server over streamable HTTP
+#   confirm            tool-name patterns that pause for your approval before running (sending, deleting…)
+#   tools              optional allow-list of tool names to expose
+
+servers:
+  # filesystem:
+  #   command: npx
+  #   args: ["-y", "@modelcontextprotocol/server-filesystem", "/Users/you/Documents/notes"]
+  #   confirm: ["write_*", "move_*", "create_*", "edit_*"]
+
+  # github:
+  #   command: docker
+  #   args: ["run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "ghcr.io/github/github-mcp-server"]
+  #   env: {GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_TOKEN}"}
+  #   confirm: ["create_*", "update_*", "merge_*", "delete_*", "push_*"]
+
+  # email (any Gmail/IMAP MCP server; check its README for the exact command):
+  #   command: npx
+  #   args: ["-y", "<gmail-mcp-package>"]
+  #   confirm: ["send_*", "delete_*", "trash_*", "modify_*"]
+
+  # remote:
+  #   url: https://example.com/mcp
+  #   headers: {Authorization: "Bearer ${REMOTE_MCP_TOKEN}"}

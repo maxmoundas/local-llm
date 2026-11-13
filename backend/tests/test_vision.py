@@ -9,7 +9,8 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")  # CUDA backend only; skipped on MLX installs
 from PIL import Image as PILImage
 
 from src.model import LocalLLM

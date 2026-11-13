@@ -5,7 +5,8 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")  # CUDA backend only; skipped on MLX installs
 
 from src.model import LocalLLM
 

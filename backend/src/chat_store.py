@@ -1,12 +1,25 @@
 """Local JSON-file persistence for chat sessions."""
 from __future__ import annotations
 
+import functools
 import json
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 CHATS_DIR = Path("chats")
+
+# Background tasks and API requests write chats concurrently; every read-modify-write holds this.
+_lock = threading.RLock()
+
+
+def _locked(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _lock:
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 def _now() -> str:
@@ -26,7 +39,9 @@ def _read(chat_id: str) -> dict | None:
 
 def _write(chat: dict) -> None:
     CHATS_DIR.mkdir(parents=True, exist_ok=True)
-    _path(chat["id"]).write_text(json.dumps(chat, indent=2), encoding="utf-8")
+    tmp = _path(chat["id"]).with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(chat, indent=2), encoding="utf-8")
+    tmp.replace(_path(chat["id"]))  # atomic: readers never see a half-written file
 
 
 def _preview(messages: list[dict]) -> str:
@@ -62,6 +77,7 @@ def list_chats() -> list[dict]:
     return result
 
 
+@_locked
 def create_chat() -> dict:
     chat = {
         "id": str(uuid.uuid4()),
@@ -74,10 +90,12 @@ def create_chat() -> dict:
     return chat
 
 
+@_locked
 def get_chat(chat_id: str) -> dict | None:
     return _read(chat_id)
 
 
+@_locked
 def rename_chat(chat_id: str, name: str) -> dict | None:
     chat = _read(chat_id)
     if chat is None:
@@ -88,6 +106,7 @@ def rename_chat(chat_id: str, name: str) -> dict | None:
     return chat
 
 
+@_locked
 def append_messages(
     chat_id: str, role: str, content: str, model_id: str | None = None, extra: dict | None = None
 ) -> dict | None:
@@ -103,6 +122,7 @@ def append_messages(
     return chat
 
 
+@_locked
 def toggle_pin(chat_id: str) -> dict | None:
     chat = _read(chat_id)
     if chat is None:
@@ -113,6 +133,7 @@ def toggle_pin(chat_id: str) -> dict | None:
     return chat
 
 
+@_locked
 def delete_chat(chat_id: str) -> bool:
     p = _path(chat_id)
     if not p.exists():

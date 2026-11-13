@@ -42,6 +42,7 @@ class ToolResult:
     text: str
     sources: list[Source] = field(default_factory=list)
     summary: str = ""  # short outcome for the step list, e.g. "6 results"
+    ok: bool = True    # False shows the step as failed (e.g. code exited non-zero)
 
 
 @dataclass
@@ -52,6 +53,9 @@ class Tool:
     run: Callable[[dict], ToolResult]
     running: Callable[[dict], str]
     done: Callable[[dict], str]
+    kind: str = "search"      # icon family in the UI: search | news | page | weather | code | file | connector
+    confirm: bool = False     # pause for the user's approval before running (side effects: sending, deleting…)
+    read_only: bool = True    # only gathers information (lets the sufficiency check end research early)
 
     @property
     def spec(self) -> dict:
@@ -272,6 +276,7 @@ def default_tools() -> list[Tool]:
             run=_news_search,
             running=lambda a: f"Searching news for {_quote(a.get('query', ''))}",
             done=lambda a: f"Searched news for {_quote(a.get('query', ''))}",
+            kind="news",
         ),
         Tool(
             name="fetch_page",
@@ -281,6 +286,7 @@ def default_tools() -> list[Tool]:
             run=_fetch_page,
             running=lambda a: f"Reading {_domain(str(a.get('url', '')))}",
             done=lambda a: f"Read {_domain(str(a.get('url', '')))}",
+            kind="page",
         ),
         Tool(
             name="get_weather",
@@ -290,5 +296,6 @@ def default_tools() -> list[Tool]:
             run=_get_weather,
             running=lambda a: f"Checking the weather in {a.get('location', '')}",
             done=lambda a: f"Checked the weather in {a.get('location', '')}",
+            kind="weather",
         ),
     ]

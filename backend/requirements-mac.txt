@@ -1,0 +1,41 @@
+# Mac / Apple Silicon — uses mlx-lm instead of bitsandbytes + CUDA.
+# Run: pip install -r requirements-mac.txt
+
+# Local model backend (Apple Silicon Metal via MLX)
+mlx>=0.16.0
+mlx-lm>=0.16.0
+
+# Image handling (cloud vision providers still supported)
+Pillow>=10.0.0
+
+# Cloud providers (registered automatically when API keys are present in .env)
+anthropic>=0.40.0
+openai>=1.50.0
+
+# Research tools (free, no API keys): DuckDuckGo web + news search
+ddgs>=9.0
+lxml>=5.0
+
+# HuggingFace (model download)
+huggingface_hub>=0.25.0
+
+# Connectors: MCP servers (email, calendar, GitHub…) configured in connectors.yaml
+mcp>=1.10
+
+# Server
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.0.0
+sse-starlette>=2.1.0
+aiofiles>=23.0.0
+
+# Config & utilities
+pyyaml>=6.0
+python-dotenv>=1.0.0
+rich>=13.7.0
+typer>=0.13.0
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.24.0
+httpx>=0.27.0

@@ -10,7 +10,12 @@ Endpoints
   GET  /api/chats/{id}
   PATCH /api/chats/{id}
   DELETE /api/chats/{id}
-  POST /api/chats/{id}/message   ← SSE streaming response
+  POST /api/chats/{id}/message   ← starts a background task, streams its events (SSE)
+  GET  /api/chats/{id}/active    ← running task for a chat (reattach after reload)
+  GET  /api/tasks/{id}/events    ← resumable SSE (?after=<seq>)
+  POST /api/tasks/{id}/cancel | reply
+  GET  /api/tasks/{id}/files/{path}
+  GET  /api/connectors
   GET/PATCH /api/settings
   GET/PATCH /api/memory
   POST /api/decide               ← Jev passthrough (structured decisions)
@@ -25,30 +30,39 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.concurrency import iterate_in_threadpool, run_in_threadpool
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from starlette.responses import StreamingResponse
+from starlette.responses import FileResponse, Response, StreamingResponse
 
 from src import chat_store, decision_service, memory_store, settings_store
+from src.agent.connectors import ConnectorHub
 from src.agent.router import ResearchRouter
-from src.agent.runner import ResearchAgent, build_answer_system
+from src.agent.runner import TaskAgent
+from src.agent import sandbox as sb
+from src.agent.sandbox import Sandbox, detect_sandbox, safe_path
 from src.agent.tools import default_tools
 from src.config import load_config
 from src.decision_service import CALL_TYPE_MEMORY, DecisionError, DecisionService, noul
-from src.guardrail_service import SUPPORT_SYSTEM_NOTE, GuardrailService
-from src.llm_service import CALL_TYPE_CHAT, LLMService
+from src.guardrail_service import GuardrailService
+from src.llm_service import LLMService
 from src.logger import get_logger, setup_logging
-from src.model import LocalLLM
+from src.model_factory import create_local_llm
 from src.providers import ProviderRegistry, build_registry
 from src.settings_store import DEFAULT_GUARDRAIL_PROMPT, DEFAULT_SYSTEM_PROMPT
+from src.tasks import store as task_store
+from src.tasks.manager import TaskManager
+from src.tasks.turn import TurnDeps, run_turn
+
+if TYPE_CHECKING:  # torch is only needed on the CUDA backend
+    from src.model import LocalLLM
 
 logger = get_logger(__name__)
-_llm: LocalLLM | None = None
+_llm: "LocalLLM | None" = None
 _registry: ProviderRegistry | None = None
 _llm_service: LLMService | None = None
 _decision_svc: DecisionService | None = None
@@ -58,9 +72,14 @@ _jev_memory: bool = True
 _guardrail_svc: GuardrailService | None = None
 _guardrails_input: bool = True
 _guardrails_output: bool = False
-# Research loop — None when disabled in settings (or before startup), so messages answer directly.
+# Agent loop — None when disabled in settings (or before startup), so messages answer directly.
 _router: ResearchRouter | None = None
-_agent: ResearchAgent | None = None
+_agent: TaskAgent | None = None
+_sandbox: Sandbox | None = None
+_sandbox_key: tuple | None = None
+_connectors = ConnectorHub()
+_tasks = TaskManager()
+_task_limits: dict = {}
 
 _MEMORY_THRESHOLD = 0.4
 _HAS_DURABLE_FACT = noul(
@@ -75,7 +94,7 @@ _HAS_DURABLE_FACT = noul(
 def _apply_settings(s: dict) -> None:
     """(Re)build every settings-driven service. Called at startup and after each PATCH."""
     global _system_prompt, _memory_enabled, _jev_memory
-    global _guardrail_svc, _guardrails_input, _guardrails_output, _router, _agent
+    global _guardrail_svc, _guardrails_input, _guardrails_output, _router, _agent, _sandbox, _sandbox_key
 
     if _llm_service is not None:
         _llm_service.set_cheapest_model(s.get("cheapest_model_id"))
@@ -100,10 +119,19 @@ def _apply_settings(s: dict) -> None:
     else:
         _guardrail_svc = None
 
+    key = (s.get("code_execution") or "auto", bool(s.get("sandbox_network", True)))
+    if key != _sandbox_key:  # detecting Docker shells out, so only redo it when these change
+        _sandbox, _sandbox_key = detect_sandbox(key[0], network=key[1]), key
+
+    _task_limits.update(
+        budget_usd=float(s["task_budget_usd"]) if s.get("task_budget_usd") else None,
+        max_seconds=float(s["task_max_minutes"]) * 60 if s.get("task_max_minutes") else None,
+        agent_model_id=s.get("agent_model_id") or None,
+    )
     if s.get("agent_enabled", True) and _llm_service is not None:
-        _router = ResearchRouter(_llm_service, _decision_svc, use_jev=bool(s.get("jev_routing", True)))
-        _agent = ResearchAgent(_llm_service, _router, default_tools(),
-                               max_steps=int(s.get("agent_max_steps") or 4))
+        _router = ResearchRouter(_llm_service, _decision_svc, use_jev=bool(s.get("jev_routing", True)),
+                                 can_run_code=_sandbox is not None, connectors=_connectors.names)
+        _agent = TaskAgent(_llm_service, _router, default_tools(), max_steps=int(s.get("agent_max_steps") or 12))
     else:
         _router = _agent = None
 
@@ -114,20 +142,29 @@ async def lifespan(app: FastAPI):
     cfg = load_config()
     setup_logging(cfg)
     logger.info("Starting backend")
-    _llm = LocalLLM(cfg)
+    _llm = create_local_llm(cfg)
     _registry = build_registry(_llm)
     saved_settings = settings_store.load()
     _llm_service = LLMService(_registry, cheapest_model_id=saved_settings.get("cheapest_model_id"))
     _decision_svc = DecisionService(os.getenv("TYPESAFE_API_KEY"))
     decision_service.configure(_decision_svc)
     _apply_settings(saved_settings)
+    _tasks.recover()
     cheapest = _registry.cheapest_model
-    logger.info("Server ready — cheapest model: %s (%s) | jev=%s | research=%s",
+    logger.info("Server ready — cheapest model: %s (%s) | jev=%s | agent=%s | code=%s",
                 cheapest.name, cheapest.id,
                 "on" if _decision_svc.available else ("off" if _decision_svc.configured else "no key"),
-                "on" if _agent else "off")
+                "on" if _agent else "off", _sandbox.name if _sandbox else "off")
     threading.Thread(target=_llm.load, daemon=True, name="model-loader").start()
+    threading.Thread(target=_start_connectors, daemon=True, name="connectors-start").start()
     yield
+    _connectors.stop()
+
+
+def _start_connectors() -> None:
+    _connectors.start()
+    if _connectors.names:
+        _apply_settings(settings_store.load())  # let the router know about connected services
 
 
 app = FastAPI(title="Local LLM API", version="1.0.0", lifespan=lifespan)
@@ -204,10 +241,7 @@ def _maybe_update_memory(user_message: str, svc: LLMService) -> None:
 
 
 def _model_dicts(registry: ProviderRegistry) -> list[dict]:
-    return [
-        {"id": m.id, "name": m.name, "provider": m.provider, "is_cheapest": m.is_cheapest}
-        for m in registry.list_models()
-    ]
+    return [m.public() for m in registry.list_models()]
 
 
 # ── Health & model discovery ───────────────────────────────────────────
@@ -266,10 +300,14 @@ async def api_rename_chat(chat_id: str, req: RenameRequest) -> dict:
     return chat
 
 
-@app.delete("/api/chats/{chat_id}", status_code=204)
-async def api_delete_chat(chat_id: str) -> None:
+@app.delete("/api/chats/{chat_id}", status_code=204, response_class=Response)
+async def api_delete_chat(chat_id: str) -> Response:
     if not chat_store.delete_chat(chat_id):
         raise HTTPException(404, "Chat not found")
+    for t in task_store.for_chat(chat_id):
+        _tasks.cancel(t["id"])
+    task_store.delete_for_chat(chat_id)
+    return Response(status_code=204)
 
 
 @app.post("/api/chats/{chat_id}/pin")
@@ -293,7 +331,12 @@ class SettingsUpdate(BaseModel):
     guardrails_topics: list[str] | None = None
     guardrails_policy: Literal["strict", "permissive"] | None = None
     agent_enabled: bool | None = None
-    agent_max_steps: int | None = Field(default=None, ge=1, le=8)
+    agent_max_steps: int | None = Field(default=None, ge=1, le=40)
+    agent_model_id: str | None = None
+    task_budget_usd: float | None = Field(default=None, ge=0, le=100)
+    task_max_minutes: float | None = Field(default=None, ge=0, le=240)
+    code_execution: Literal["auto", "docker", "local", "off"] | None = None
+    sandbox_network: bool | None = None
     jev_enabled: bool | None = None
     jev_model: str | None = None
     jev_routing: bool | None = None
@@ -312,6 +355,8 @@ async def api_get_settings() -> dict:
         "default_guardrail_prompt": DEFAULT_GUARDRAIL_PROMPT,
         "jev_configured": bool(_decision_svc and _decision_svc.configured),
         "models": _model_dicts(registry),
+        "sandbox_active": _sandbox.name if _sandbox else "off",
+        "connectors": _connectors.status(),
     }
 
 
@@ -361,7 +406,7 @@ async def api_decide(req: DecideRequest) -> dict:
     return {"answers": {k: vars(a) for k, a in answers.items()}}
 
 
-# ── Sending a message (SSE) ────────────────────────────────────────────
+# ── Sending a message: background tasks + resumable SSE ─────────────────
 
 _SSE_HEADERS = {
     "Cache-Control": "no-cache, no-transform",
@@ -370,23 +415,46 @@ _SSE_HEADERS = {
 }
 
 
-def _sse(data: dict) -> str:
-    return f"data: {json.dumps(data)}\n\n"
+def _sse_stream(task_id: str, after: int):
+    """Event stream for a task. `id:` carries the seq so clients can resume with ?after=."""
+    for evt in _tasks.subscribe(task_id, after):
+        if evt.get("type") == "ping":
+            yield ": ping\n\n"
+            continue
+        yield f"id: {evt['seq']}\ndata: {json.dumps(evt)}\n\n"
 
 
-def _blocked_event(target: str, reason: str | None) -> str:
-    data: dict = {"type": "blocked", "target": target}
-    if reason:
-        data["reason"] = reason
-    return _sse(data)
+def _turn_deps(svc: LLMService) -> TurnDeps:
+    return TurnDeps(
+        svc=svc,
+        build_messages=_build_messages,
+        guardrails=_guardrail_svc,
+        guard_input=_guardrails_input,
+        guard_output=_guardrails_output,
+        update_memory=(lambda text: _maybe_update_memory(text, svc)) if _memory_enabled else None,
+        router=_router,
+        agent=_agent,
+        sandbox=_sandbox,
+        connectors=_connectors if _connectors.names else None,
+        agent_model_id=_task_limits.get("agent_model_id"),
+        budget_usd=_task_limits.get("budget_usd"),
+        max_seconds=_task_limits.get("max_seconds"),
+    )
 
 
 @app.post("/api/chats/{chat_id}/message")
 async def api_send_message(chat_id: str, req: MessageRequest) -> Any:
+    """Start the turn as a background task and stream its events.
+
+    The task keeps running if the client disconnects; reconnect with
+    GET /api/tasks/{task_id}/events?after=<last seq>. Stop it with POST /api/tasks/{id}/cancel.
+    """
     registry = _require_registry()
     svc = _require_service()
     if chat_store.get_chat(chat_id) is None:
         raise HTTPException(404, "Chat not found")
+    if _tasks.active_for_chat(chat_id):
+        raise HTTPException(409, "This chat is still working on the previous message")
 
     model_id = req.model_id or registry.default_model_id
     try:
@@ -394,124 +462,71 @@ async def api_send_message(chat_id: str, req: MessageRequest) -> Any:
     except KeyError:
         raise HTTPException(400, f"Unknown model: {model_id}")
 
-    # All blocking work (guardrails, routing, tools, generation) happens inside the
-    # sync generator, which runs in a worker thread — never on the event loop.
-    return StreamingResponse(
-        _close_on_disconnect(_sse_generator(chat_id, req, model_id, svc)),
-        media_type="text/event-stream",
-        headers=_SSE_HEADERS,
-    )
+    deps = _turn_deps(svc)
+    task_id = _tasks.start(chat_id, model_id,
+                           lambda ctx: run_turn(ctx, chat_id, req.content, req.image_base64, model_id, deps))
+    return StreamingResponse(_sse_stream(task_id, -1), media_type="text/event-stream",
+                             headers={**_SSE_HEADERS, "X-Task-Id": task_id})
 
 
-async def _close_on_disconnect(gen):
-    """Drive a sync generator from a thread, and close it when the client goes away.
+@app.get("/api/chats/{chat_id}/active")
+async def api_active_task(chat_id: str) -> dict | None:
+    """The task currently running for this chat, if any (used to reattach after a reload)."""
+    return _tasks.active_for_chat(chat_id)
 
-    Starlette stops pulling on disconnect but never closes a sync generator, so the
-    stop button would leave it suspended forever. Closing it raises GeneratorExit at
-    its current yield, which saves the partial reply and closes the provider stream.
-    """
+
+@app.get("/api/tasks/{task_id}/events")
+async def api_task_events(task_id: str, after: int = -1) -> Any:
+    if task_store.get(task_id) is None:
+        raise HTTPException(404, "Task not found")
+    return StreamingResponse(_sse_stream(task_id, after), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+
+@app.get("/api/tasks/{task_id}")
+async def api_get_task(task_id: str) -> dict:
+    task = task_store.get(task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    return {**task, "active": _tasks.is_active(task_id)}
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+async def api_cancel_task(task_id: str) -> dict:
+    return {"cancelled": _tasks.cancel(task_id)}
+
+
+class TaskReply(BaseModel):
+    request_id: str | None = None
+    answer: str | None = None
+    approved: bool | None = None
+
+
+@app.post("/api/tasks/{task_id}/reply")
+async def api_reply_task(task_id: str, req: TaskReply) -> dict:
+    payload = {k: v for k, v in req.model_dump().items() if v is not None}
+    if not _tasks.reply(task_id, payload):
+        raise HTTPException(409, "This task is not waiting for input")
+    return {"ok": True}
+
+
+@app.get("/api/tasks/{task_id}/files/{path:path}")
+async def api_task_file(task_id: str, path: str) -> Any:
+    """Download a file the agent created in this task's workspace."""
+    if task_store.get(task_id) is None:
+        raise HTTPException(404, "Task not found")
+    workspace = (sb.WORKSPACES_DIR / task_id).resolve()
     try:
-        async for chunk in iterate_in_threadpool(gen):
-            yield chunk
-    finally:
-        threading.Thread(target=_close_when_idle, args=(gen,), daemon=True).start()
+        target = safe_path(workspace, path)
+    except ValueError:
+        raise HTTPException(400, "Invalid path")
+    if not target.is_file():
+        raise HTTPException(404, "File not found")
+    return FileResponse(target, filename=target.name)
 
 
-def _close_when_idle(gen, timeout: float = 120.0) -> None:
-    """gen.close() fails while a step is mid-flight in a worker thread; retry until it lands."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            gen.close()
-            return
-        except ValueError:  # "generator already executing"
-            time.sleep(0.05)
-
-
-def _sse_generator(chat_id: str, req: MessageRequest, model_id: str, svc: LLMService):
-    """Event stream for one user turn.
-
-    Events: status · step · sources · token · blocked · error · done
-    (status/step/sources only appear when the message goes through research).
-    """
-    chat = chat_store.get_chat(chat_id)
-    is_new_chat = chat["name"] == "New Chat"
-    support_note = ""
-
-    # Input guardrail — runs before appending so blocked messages aren't stored
-    if _guardrail_svc is not None and _guardrails_input:
-        guard = _guardrail_svc.check(req.content, "input")
-        if guard.blocked:
-            logger.info("Input blocked by guardrail: %s", guard.reason)
-            yield _blocked_event("input", guard.reason)
-            return
-        if guard.action == "support":
-            support_note = SUPPORT_SYSTEM_NOTE
-
-    chat = chat_store.append_messages(chat_id, "user", req.content, model_id=model_id)
-    messages = _build_messages(chat)
-    messages[0]["content"] += support_note
-
-    if _memory_enabled:
-        threading.Thread(target=_maybe_update_memory, args=(req.content, svc), daemon=True).start()
-
-    # Research — the router decides per message; images skip it (tools can't see them).
-    steps: list[dict] = []
-    sources: list[dict] = []
-    router, agent = _router, _agent
-    if router is not None and agent is not None and not req.image_base64:
-        if router.decide(req.content, chat["messages"]).research:
-            notes = ""
-            for evt in agent.run(chat["messages"], req.content, model_id, context_id=chat_id):
-                if evt.type == "status":
-                    yield _sse({"type": "status", "text": evt.text})
-                elif evt.type == "step":
-                    yield _sse({"type": "step", "step": evt.step})
-                elif evt.type == "done":
-                    notes, sources, steps = evt.notes, evt.sources, evt.steps
-            messages[0]["content"] = build_answer_system(messages[0]["content"], notes)
-            if sources:
-                yield _sse({"type": "sources", "sources": sources})
-            yield _sse({"type": "status", "text": "Writing the answer"})
-
-    extra = {k: v for k, v in (("steps", steps), ("sources", sources)) if v}
-    full_response = ""
-    try:
-        for token in svc.stream(
-            messages, model_id,
-            image_base64=req.image_base64,
-            call_type=CALL_TYPE_CHAT,
-            context_id=chat_id,
-        ):
-            full_response += token
-            yield _sse({"type": "token", "content": token})
-    except GeneratorExit:
-        # The client stopped generation: keep what was written so far.
-        if full_response:
-            chat_store.append_messages(chat_id, "assistant", full_response, extra={**extra, "stopped": True})
-        raise
-    except Exception as exc:
-        # LLMService already logged the error; just surface it to the client.
-        yield _sse({"type": "error", "message": str(exc)})
-        return
-
-    # Output guardrail check — runs after full response is received
-    if _guardrail_svc is not None and _guardrails_output:
-        guard = _guardrail_svc.check(full_response, "output")
-        if guard.blocked:
-            logger.info("Output blocked by guardrail: %s", guard.reason)
-            yield _blocked_event("output", guard.reason)
-            return  # do not store the blocked response
-
-    chat_store.append_messages(chat_id, "assistant", full_response, extra=extra)
-
-    # On the first exchange, generate a descriptive title via the cheapest model.
-    if is_new_chat:
-        title = svc.generate_title(req.content)
-        chat_store.rename_chat(chat_id, title)
-
-    updated = chat_store.get_chat(chat_id)
-    yield _sse({"type": "done", "name": updated["name"]})
+@app.get("/api/connectors")
+async def api_connectors() -> dict:
+    return {"connectors": _connectors.status(), "tools": [t.name for t in _connectors.tools]}
 
 
 # ── OpenAI-compatible (/v1/*) ──────────────────────────────────────────

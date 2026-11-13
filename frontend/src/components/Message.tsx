@@ -1,21 +1,29 @@
 import { memo, useState } from 'react'
-import type { ResearchStep, SourceRef } from '../types'
+import type { AgentAction, InputRequest, SourceRef, TaskFile, Usage } from '../types'
+import Activity from './Activity'
 import { CheckIcon, CopyIcon } from './Icons'
 import Markdown from './Markdown'
-import ResearchSteps from './ResearchSteps'
 
 export interface DisplayMessage {
   id: string
   role: 'user' | 'assistant'
   content: string
   imageDataUrl?: string
-  steps?: ResearchStep[]
+  actions?: AgentAction[]
   sources?: SourceRef[]
-  status?: string        // live research status (only while streaming)
+  files?: TaskFile[]
+  taskId?: string
+  status?: string          // live one-line status (only while streaming)
+  pending?: InputRequest   // the agent is waiting on the user
+  startedAt?: number       // live turns: when the turn began (drives the timer)
+  elapsedMs?: number       // saved turns: how long the work took
+  usage?: Usage
   streaming?: boolean
   stopped?: boolean
   notice?: { kind: 'error' | 'blocked'; text: string }
 }
+
+type ReplyFn = (reply: { request_id: string; answer?: string; approved?: boolean }) => void
 
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false)
@@ -35,7 +43,7 @@ function CopyButton({ text }: { text: string }) {
   )
 }
 
-function Message({ msg, isLast }: { msg: DisplayMessage; isLast: boolean }) {
+function Message({ msg, isLast, onReply }: { msg: DisplayMessage; isLast: boolean; onReply?: ReplyFn }) {
   if (msg.role === 'user') {
     return (
       <div className="msg user">
@@ -48,22 +56,40 @@ function Message({ msg, isLast }: { msg: DisplayMessage; isLast: boolean }) {
     )
   }
 
-  const researching = !!msg.streaming && !msg.content
-  // Show the block while a live status is running, and afterwards only if a tool actually ran.
-  const hasResearch = (msg.steps?.length ?? 0) > 0 || (researching && !!msg.status)
-  const waiting = researching && !hasResearch
+  const working = !!msg.streaming && !msg.content
+  // The activity card appears once a tool runs (or the agent asks something). Before that, and for
+  // plain answers, a single quiet status line is enough.
+  const hasActivity = (msg.actions?.length ?? 0) > 0 || !!msg.pending
+  const showLine = working && !hasActivity
 
   return (
     <div className="msg assistant">
-      {hasResearch && (
-        <ResearchSteps steps={msg.steps ?? []} sources={msg.sources ?? []} status={msg.status} active={researching} />
+      {hasActivity && (
+        <Activity
+          actions={msg.actions ?? []}
+          sources={msg.sources ?? []}
+          files={msg.files ?? []}
+          taskId={msg.taskId}
+          active={working}
+          status={msg.status}
+          pending={msg.pending}
+          startedAt={msg.startedAt}
+          elapsedMs={msg.streaming ? undefined : msg.elapsedMs}
+          usage={msg.streaming ? undefined : msg.usage}
+          onReply={onReply}
+        />
+      )}
+      {showLine && (
+        <div className="status-line" aria-live="polite">
+          <span className="spinner small" />
+          <span className="shimmer" key={msg.status ?? 'thinking'}>{msg.status ?? 'Thinking'}</span>
+        </div>
       )}
       {msg.content && (
         <div className="prose">
           <Markdown content={msg.content} />
         </div>
       )}
-      {waiting && <div className="thinking-dot" aria-label="Thinking" />}
       {msg.streaming && msg.content && <span className="stream-dot" aria-hidden="true" />}
       {msg.notice && <div className={`notice ${msg.notice.kind}`}>{msg.notice.text}</div>}
       {msg.stopped && !msg.streaming && <div className="stopped-note">Stopped</div>}

@@ -3,11 +3,15 @@ from __future__ import annotations
 import base64
 from collections.abc import Iterator
 from io import BytesIO
+from typing import TYPE_CHECKING
 
 from PIL import Image as PILImage
 
-from src.model import LocalLLM
+from src import usage
 from src.providers.base import BaseProvider, ModelOption
+
+if TYPE_CHECKING:  # avoid importing torch on the MLX backend
+    from src.model import LocalLLM
 
 
 class LocalProvider(BaseProvider):
@@ -21,7 +25,14 @@ class LocalProvider(BaseProvider):
     @property
     def models(self) -> list[ModelOption]:
         short_name = self._llm.repo_id.split("/")[-1]
-        return [ModelOption(id=self._llm.repo_id, name=short_name, provider="local", is_cheapest=True)]
+        if getattr(self, "_model_option", None) is None or self._model_option.id != self._llm.repo_id:
+            # Prompted tool calls: in-process models have no tool-calling API.
+            self._model_option = ModelOption(
+                id=self._llm.repo_id, name=short_name, provider="local", is_cheapest=True, tools="prompted",
+                vision=getattr(self._llm, "supports_vision", True),
+                max_output_tokens=int(getattr(self._llm, "cfg", {}).get("max_new_tokens", 2048) or 2048),
+            )
+        return [self._model_option]
 
     @property
     def ready(self) -> bool:
@@ -33,17 +44,35 @@ class LocalProvider(BaseProvider):
         if image_base64:
             img_bytes = base64.b64decode(image_base64)
             image = PILImage.open(BytesIO(img_bytes)).convert("RGB")
-            return self._llm.stream_with_image(image, messages)
-        return self._llm.stream(messages)
+            return _metered(self._llm.stream_with_image(image, messages), messages, model_id)
+        return _metered(self._llm.stream(messages), messages, model_id)
 
     def complete(self, messages: list[dict], model_id: str, max_tokens: int | None = None) -> str:
         if not self._llm.is_loaded:
             raise RuntimeError("Local model is still loading — please wait a moment and try again")
         if max_tokens is None:
-            return self._llm.generate(messages)
-        return self._llm.generate(messages, max_new_tokens=max_tokens)
+            out = self._llm.generate(messages)
+        else:
+            out = self._llm.generate(messages, max_new_tokens=max_tokens)
+        usage.record(model_id, _chars(messages) // 4, len(out or "") // 4)
+        return out
 
     def count_tokens(self, text: str) -> int:
         if not self._llm.is_loaded:
             return len(text) // 4  # rough estimate while model loads
         return self._llm.count_tokens(text)
+
+
+def _chars(messages: list[dict]) -> int:
+    return sum(len(m["content"]) if isinstance(m.get("content"), str) else 0 for m in messages)
+
+
+def _metered(tokens: Iterator[str], messages: list[dict], model_id: str) -> Iterator[str]:
+    """Record approximate usage (free, but it keeps token counts comparable across models)."""
+    out = 0
+    try:
+        for t in tokens:
+            out += len(t)
+            yield t
+    finally:
+        usage.record(model_id, _chars(messages) // 4, out // 4)

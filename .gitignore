@@ -5,6 +5,9 @@ models/
 backend/chats/
 backend/logs/
 backend/.env
+# task database + per-task code workspaces; your MCP servers (may reference tokens)
+backend/data/
+backend/connectors.yaml
 
 # Frontend build output and deps
 frontend/node_modules/

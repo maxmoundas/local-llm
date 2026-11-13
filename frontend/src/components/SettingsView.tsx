@@ -3,22 +3,29 @@ import { api } from '../api/client'
 import { getThemePref, setThemePref, type ThemePref } from '../lib/theme'
 import type { AppSettings } from '../types'
 
-type Editable = Omit<AppSettings, 'models' | 'jev_configured' | 'default_system_prompt' | 'default_guardrail_prompt'>
+type Editable = Omit<AppSettings, 'models' | 'jev_configured' | 'default_system_prompt' | 'default_guardrail_prompt' | 'sandbox_active' | 'connectors'>
 type Tab = 'general' | 'research' | 'jev' | 'safety' | 'memory' | 'models'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'general', label: 'General' },
-  { id: 'research', label: 'Research' },
+  { id: 'research', label: 'Agent' },
   { id: 'jev', label: 'Jev' },
   { id: 'safety', label: 'Safety' },
   { id: 'memory', label: 'Memory' },
   { id: 'models', label: 'Models' },
 ]
 
-const PROVIDER_LABEL: Record<string, string> = { local: 'Local', anthropic: 'Anthropic', openai: 'OpenAI' }
+const PROVIDER_LABEL: Record<string, string> = {
+  local: 'Local', anthropic: 'Anthropic', openai: 'OpenAI', ollama: 'Ollama', lmstudio: 'LM Studio',
+}
+
+const SANDBOX_LABEL: Record<string, string> = { docker: 'Docker sandbox', local: 'Local process (not isolated)', off: 'Off' }
 
 function editable(s: AppSettings): Editable {
-  const { models: _m, jev_configured: _j, default_system_prompt: _d, default_guardrail_prompt: _g, ...rest } = s
+  const {
+    models: _m, jev_configured: _j, default_system_prompt: _d, default_guardrail_prompt: _g,
+    sandbox_active: _sa, connectors: _c, ...rest
+  } = s
   return rest
 }
 
@@ -144,22 +151,69 @@ export default function SettingsView({ onDisplayName }: { onDisplayName: (name: 
 
               {tab === 'research' && (<>
                 <p className="settings-intro">
-                  For questions that need current information, the assistant plans a few steps — web and news search,
-                  reading pages, checking the weather — reviews what it found, and then answers with sources.
-                  A router decides per message, so everyday questions are answered directly.
+                  When a message needs more than a direct answer, the assistant works on it step by step in the
+                  background: searching and reading the web, running code, working with files, and using connected
+                  services. You see a one-line update for each step. Work continues if you close the tab.
                 </p>
-                <Row name="Multi-step research" hint="Turn off to always answer directly from the model.">
+                <Row name="Agent" hint="Turn off to always answer directly from the model.">
                   <Toggle checked={draft.agent_enabled} onChange={v => set('agent_enabled', v)} />
                 </Row>
-                <Row name="Maximum research steps" hint="Each step can run several searches or page reads in parallel.">
+                <Row name="Maximum steps" hint="Each step can run several tools in parallel.">
                   <select className="select" value={draft.agent_max_steps} disabled={!draft.agent_enabled}
                           onChange={e => set('agent_max_steps', Number(e.target.value))}>
-                    {[1, 2, 3, 4, 5, 6, 8].map(n => <option key={n} value={n}>{n}</option>)}
+                    {[2, 4, 6, 8, 12, 16, 24, 32, 40].map(n => <option key={n} value={n}>{n}</option>)}
                   </select>
                 </Row>
+                <Row name="Spending limit per task" hint="Stops the tool loop once a task has spent this much on API calls, then answers with what it has.">
+                  <select className="select" value={String(draft.task_budget_usd ?? 0)} disabled={!draft.agent_enabled}
+                          onChange={e => set('task_budget_usd', Number(e.target.value) || null)}>
+                    {[0.05, 0.1, 0.25, 0.5, 1, 2, 5].map(n => <option key={n} value={String(n)}>${n.toFixed(2)}</option>)}
+                    <option value="0">No limit</option>
+                  </select>
+                </Row>
+                <Row name="Time limit per task">
+                  <select className="select" value={String(draft.task_max_minutes ?? 0)} disabled={!draft.agent_enabled}
+                          onChange={e => set('task_max_minutes', Number(e.target.value) || null)}>
+                    {[2, 5, 10, 20, 30, 60, 120].map(n => <option key={n} value={String(n)}>{n} min</option>)}
+                    <option value="0">No limit</option>
+                  </select>
+                </Row>
+                <Row name="Model for agent steps" hint="Picks tools between steps. A cheap model here keeps long tasks cheap; the chat model still writes the answer.">
+                  <select className="select" value={draft.agent_model_id ?? ''} disabled={!draft.agent_enabled}
+                          onChange={e => set('agent_model_id', e.target.value || null)}>
+                    <option value="">Same as chat model</option>
+                    {Object.entries(byProvider).map(([provider, ms]) => (
+                      <optgroup key={provider} label={PROVIDER_LABEL[provider] ?? provider}>
+                        {ms.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                      </optgroup>
+                    ))}
+                  </select>
+                </Row>
+
+                <h2 className="settings-subhead">Code</h2>
+                <Row name="Run code" hint={`Now: ${SANDBOX_LABEL[settings.sandbox_active] ?? settings.sandbox_active}. Auto uses Docker when it's running. "Local" runs code directly on this machine — only use it if you trust every page the agent reads.`}>
+                  <Segmented value={draft.code_execution} onChange={v => set('code_execution', v)}
+                             options={[{ value: 'auto', label: 'Auto' }, { value: 'docker', label: 'Docker' },
+                                       { value: 'local', label: 'Local' }, { value: 'off', label: 'Off' }]} />
+                </Row>
+                <Row name="Internet access for code" hint="Lets sandboxed code install packages and call APIs.">
+                  <Toggle checked={draft.sandbox_network} disabled={draft.code_execution === 'off'}
+                          onChange={v => set('sandbox_network', v)} />
+                </Row>
+
+                <h2 className="settings-subhead">Connectors</h2>
+                {Object.keys(settings.connectors ?? {}).length === 0 ? (
+                  <p className="setting-hint">
+                    None yet. Add MCP servers (email, calendar, GitHub, files…) to <code>backend/connectors.yaml</code> —
+                    see <code>connectors.example.yaml</code> — and restart the backend.
+                  </p>
+                ) : Object.entries(settings.connectors).map(([name, state]) => (
+                  <Row key={name} name={name}><span className="muted-text">{state}</span></Row>
+                ))}
+
                 <Row name="Router" hint={jevActive && draft.jev_routing
-                  ? 'Jev decides when to research and when the findings are enough.'
-                  : 'The utility model decides when to research; the planner decides when to stop.'}>
+                  ? 'Jev decides when a message needs tools, and when research findings are enough.'
+                  : 'The utility model decides when a message needs tools; the agent decides when to stop.'}>
                   <span className="muted-text">{jevActive && draft.jev_routing ? 'Jev' : 'Utility model'}</span>
                 </Row>
               </>)}
@@ -184,7 +238,7 @@ export default function SettingsView({ onDisplayName }: { onDisplayName: (name: 
                   </select>
                 </Row>
                 <h2 className="settings-subhead">Use Jev for</h2>
-                <Row name="Research routing" hint="Whether a message needs research, and whether the findings are enough.">
+                <Row name="Agent routing" hint="Whether a message needs tools, and whether research findings are enough.">
                   <Toggle checked={draft.jev_routing} disabled={!jevActive} onChange={v => set('jev_routing', v)} />
                 </Row>
                 <Row name="Safety checks" hint="Hazard probabilities and harm severity for each message.">
@@ -258,7 +312,7 @@ export default function SettingsView({ onDisplayName }: { onDisplayName: (name: 
               </>)}
 
               {tab === 'models' && (
-                <Row name="Utility model" hint="Writes chat titles, updates memory, and makes any decision Jev isn't handling. Research uses the model you chat with.">
+                <Row name="Utility model" hint="Writes chat titles, updates memory, and makes any decision Jev isn't handling. The agent uses the chat model unless you pick one under Agent.">
                   <select className="select" value={draft.cheapest_model_id ?? ''}
                           onChange={e => set('cheapest_model_id', e.target.value || null)}>
                     <option value="">Auto (cheapest available)</option>

@@ -1,14 +1,11 @@
 """Shared fixtures for tests. Uses a mock model to avoid requiring the real weights."""
 from __future__ import annotations
 
-import torch
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
-
-from src.model import LocalLLM
 
 
 @pytest.fixture
@@ -31,8 +28,13 @@ def cfg() -> dict[str, Any]:
 
 
 @pytest.fixture
-def mock_llm(cfg) -> LocalLLM:
-    """Returns a LocalLLM with mocked processor+model (no real weights needed)."""
+def mock_llm(cfg):
+    """Returns a LocalLLM with mocked processor+model (no real weights needed).
+
+    Skips on installs without torch (the MLX backend on macOS).
+    """
+    torch = pytest.importorskip("torch")
+    from src.model import LocalLLM
     llm = LocalLLM(cfg)
 
     # Mock the underlying tokenizer (returned by processor.tokenizer)
@@ -89,9 +91,18 @@ def isolate_data_files(tmp_path, monkeypatch):
     Message handling starts background memory updates, so any test that sends a
     message could otherwise write a mocked reply into the user's real memory file.
     """
+    import src.agent.sandbox as sb
     import src.chat_store as cs
+    import src.tasks.store as ts
     import src.memory_store as ms
     import src.settings_store as ss
     monkeypatch.setattr(ms, "MEMORY_PATH", tmp_path / "memory.txt")
     monkeypatch.setattr(ss, "SETTINGS_PATH", tmp_path / "settings.json")
     monkeypatch.setattr(cs, "CHATS_DIR", tmp_path / "chats")
+    monkeypatch.setattr(ts, "DB_PATH", tmp_path / "tasks.db")
+    monkeypatch.setattr(sb, "WORKSPACES_DIR", tmp_path / "workspaces")
+
+
+def pytest_addoption(parser):
+    parser.addoption("--model", action="append", default=[],
+                     help="Model id(s) from models.yaml to run the contract suite against (tests/contract).")

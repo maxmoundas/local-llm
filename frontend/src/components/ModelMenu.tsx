@@ -10,7 +10,7 @@ interface Props {
   placement?: 'up' | 'down'
 }
 
-const PROVIDER_LABELS: Record<string, string> = {
+const PROVIDER_LABELS: Record<string, string> = { ollama: 'Ollama', lmstudio: 'LM Studio',
   local: 'Local',
   anthropic: 'Anthropic',
   openai: 'OpenAI',

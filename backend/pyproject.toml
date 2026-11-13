@@ -14,6 +14,7 @@ log_cli = true
 log_cli_level = "WARNING"
 markers = [
     "integration: hits real external APIs (requires API keys in .env)",
+    "contract: model contract suite — run with --model <id> (tests/contract)",
 ]
 filterwarnings = [
     "ignore:builtin type.*has no __module__:DeprecationWarning",

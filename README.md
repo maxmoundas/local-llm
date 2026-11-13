@@ -29,13 +29,12 @@ The backend is a FastAPI application (`backend/serve.py`) running on port 8000.
 
 **`src/providers/`** -- Provider abstraction layer.
 
-- `BaseProvider` (ABC): defines `stream(messages, model_id, image_base64)` and `count_tokens(text)`.
-- `LocalProvider`: wraps `LocalLLM`, always registered. Returns a descriptive error if a request arrives before the model finishes loading.
-- `AnthropicProvider`: wraps the Anthropic SDK, registers Haiku 4.5 and Sonnet 4.6 if `ANTHROPIC_API_KEY` is set.
-- `OpenAIProvider`: wraps the OpenAI SDK, registers GPT-5.4 Mini if `OPENAI_API_KEY` is set.
-- `ProviderRegistry`: maps model IDs to their provider. `build_registry()` auto-discovers providers at startup based on available environment variables. The first registered model (local) is the default.
+- `BaseProvider` (ABC): `stream`, `complete`, and `complete_with_tools` (native tool calling where the provider has it, prompted JSON with lenient parsing and one repair retry otherwise).
+- `LocalProvider`: wraps the in-process model (`model_factory.py` picks Transformers/CUDA or MLX/Apple Silicon). Returns a descriptive error if a request arrives before the model finishes loading.
+- `AnthropicProvider` / `OpenAICompatibleProvider`: cloud APIs and any OpenAI-compatible server (Ollama, LM Studio, OpenRouter…). Both record real token usage and cache the system prompt where supported.
+- `ProviderRegistry`: built from `models.yaml` by `build_registry()`; maps model IDs to providers and picks the cheapest ready model for utility calls.
 
-**`src/server.py`** -- FastAPI routes and streaming. On startup the provider registry is built immediately (cloud providers available at once) and the local model loads in a background thread — the server accepts requests within seconds regardless of how long the model takes to load. When a message is sent, the server resolves the provider for the requested `model_id`, calls `provider.stream()`, and yields each token as a Server-Sent Event. The full response and the model used are written to the chat store after streaming completes. Also exposes OpenAI-compatible `/v1/chat/completions` and `/v1/models` endpoints.
+**`src/server.py`** -- FastAPI routes. On startup the registry is built (cloud and local-server models available at once), the in-process model loads in a background thread, and MCP connectors start. Each message runs as a background task (`src/tasks/`) whose events stream over SSE. Also exposes OpenAI-compatible `/v1/chat/completions` and `/v1/models` endpoints.
 
 **`src/chat_store.py`** -- Chat persistence (see below).
 
@@ -43,27 +42,30 @@ The backend is a FastAPI application (`backend/serve.py`) running on port 8000.
 
 **`src/logger.py`** -- Rotating file logger (10 MB per file, 5 backups) with optional console output, written to `backend/logs/`.
 
-### Research (multi-step answers)
+### Agent (research, code, connectors)
 
-For questions that need current or external information, the assistant researches before answering, showing one-line status updates as it goes ("Checking the weather in Nashville", "Searching news for “…”", "Reviewing what I found").
+When a message needs tools, the assistant works on it step by step as a **background task**: it plans, calls tools (several in parallel), reads the results, and repeats until done, then writes the answer. Each step shows as a one-line update ("Searching the web for “…”", "Running code: load sales.csv", "Reading nytimes.com") in an animated timeline. Tasks keep running if the tab closes; reopening the chat reattaches to the live task.
 
 ```
 message ─► router ── no ──► answer directly
               │ yes
               ▼
-        ┌─► planner (chat model, tool calling) ─► tools in parallel ─┐
-        │                                                           │
-        └──── not enough ◄── sufficiency check (Jev) ◄──────────────┘
-                                   │ enough / max steps / planner stops
+        ┌─► planner (tool calls, any model) ─► tools in parallel ─► work log ─┐
+        │                                                                     │
+        └── continue ◄── limits: steps · $ budget · time · cancel ◄──────────┘
+                                   │ done / limit hit
                                    ▼
-                     answer streamed with research notes + sources
+                     answer streamed from the work log (+ sources, files)
 ```
 
-- **`src/agent/router.py`** -- `ResearchRouter.decide()` asks Jev whether the message needs fresh/external information (threshold 0.5; on a 24-prompt labeled set research prompts scored 0.82–0.98 and others 0.02–0.07). Falls back to a yes/no from the utility model. `enough()` asks Jev whether the notes so far fully answer the question (stop at ≥ 0.75).
-- **`src/agent/runner.py`** -- `ResearchAgent.run()` yields `status` / `step` / `done` events. The planner is the user's selected chat model using native tool calling (Anthropic, OpenAI) or a prompted-JSON fallback (local). Up to 4 tool calls run in parallel per step; repeated calls are skipped.
-- **`src/agent/tools.py`** -- free, keyless tools: `web_search` and `news_search` (DuckDuckGo via `ddgs`), `fetch_page` (readable text from a URL; refuses private/loopback hosts), `get_weather` (Open-Meteo). Each tool defines its own present- and past-tense status line.
+- **`src/agent/runner.py`** — `TaskAgent`. Stateless turns over a rendered work log, so every model (native or prompted tool calling) runs the same loop. Every tool gets an optional `status` argument the model fills with the user-facing line (no extra LLM calls); templates are the fallback. Internal tools: `update_plan` (a private plan) and `ask_user` (pauses for your answer). Old log entries are trimmed, then folded into a summary by the cheapest model when the log outgrows the model's context. Stops on step, spending, and time limits, or after repeated failures.
+- **`src/agent/tools.py`** — free, keyless research tools: `web_search`, `news_search`, `fetch_page`, `get_weather`.
+- **`src/agent/sandbox.py` + `workspace_tools.py`** — `run_code` (python/bash/node), `write_file`, `read_file`, `list_files` in a per-task workspace. Code runs in a Docker container per task (`python:3.12-slim`, CPU/memory/pid limits, no host env vars, network optional); files the agent creates appear as downloads under the answer. Without Docker, code tools are off unless you choose the unsandboxed "Local" mode in Settings.
+- **`src/agent/connectors.py`** — MCP servers from `backend/connectors.yaml` (see `connectors.example.yaml`) become tools for any model: email, calendar, GitHub, files… Tools matching a `confirm` pattern pause for your **Allow / Deny** before running.
+- **`src/agent/router.py`** — decides per message whether tools are needed (Jev, or the utility model), and whether research notes are already sufficient.
+- **`src/tasks/`** — `TaskManager` runs each turn on its own thread with an append-only event log (SQLite, `data/tasks.db`); `turn.py` is the per-message flow (guardrails → routing → agent → answer → title).
 
-Messages with images skip research. Research can be turned off, and its step limit changed, in **Settings → Research**.
+Settings → **Agent**: max steps, spending and time limits per task, a separate (cheap) model for agent steps, code execution mode, and connector status.
 
 ### Jev (TypeSafe System One)
 
@@ -115,33 +117,37 @@ Each conversation is stored as a JSON file in `backend/chats/`, named by UUID (`
 
 ### Streaming (SSE)
 
-`POST /api/chats/{id}/message` returns `text/event-stream`. Each event is a JSON object on a `data:` line:
+`POST /api/chats/{id}/message` starts the turn as a background task (id in the `X-Task-Id` header) and streams its events. Each event is `id: <seq>` + a JSON `data:` line. Disconnecting does **not** stop the task: resume with `GET /api/tasks/{id}/events?after=<last seq>`, find a chat's running task with `GET /api/chats/{id}/active`, stop it with `POST /api/tasks/{id}/cancel`.
 
-| Event type | Payload | Description |
+| Event type | Description |
+|---|---|
+| `task_start` | `{ task_id }` — first event |
+| `status` | one-line status between steps ("Thinking", "Writing the answer") |
+| `action` | `{ action: { id, tool, kind, label, status, summary, started, ended } }` — a tool call; sent when it starts (`running`/`waiting`) and again when it ends (`done`/`failed`/`denied`). Upsert by `id`. |
+| `sources` | `{ sources: [{ title, url }] }` |
+| `input_request` / `input_resolved` | the agent is waiting on a question or approval — answer with `POST /api/tasks/{id}/reply` |
+| `token` | `{ content }` — answer text (not persisted; a reconnect to a live task replays them) |
+| `blocked` / `error` | stopped by a safety check / something failed |
+| `done` | `{ name, files }` — chat title and files created |
+| `usage` | tokens and `cost_usd` for the whole turn |
+| `task_end` | `{ status: done \| failed \| cancelled \| interrupted }` — last event |
+
+The frontend rebuilds a turn by folding these events (`frontend/src/lib/turn.ts`), so live view, reconnects, and reloads all show the same thing.
+
+### Multi-provider system (models.yaml)
+
+Every model comes from **`backend/models.yaml`** — no code changes to add one. Each entry records its provider, tool-calling mode (`native`, `prompted` JSON, or `auto` = try native, fall back), vision, context window, max output, and price per 1M tokens (used for cost tracking and task budgets).
+
+| Provider type | Examples | Activation |
 |---|---|---|
-| `status` | `{ "type": "status", "text": "..." }` | One-line research status (research only) |
-| `step` | `{ "type": "step", "step": { "tool", "label", "summary" } }` | A finished tool call (research only) |
-| `sources` | `{ "type": "sources", "sources": [{ "title", "url" }] }` | Sources gathered (research only) |
-| `token` | `{ "type": "token", "content": "..." }` | One token from the model |
-| `blocked` | `{ "type": "blocked", "target": "input" \| "output", "reason": "..." }` | Stopped by a safety check |
-| `done` | `{ "type": "done", "name": "..." }` | Stream complete, carries the chat title |
-| `error` | `{ "type": "error", "message": "..." }` | Generation failed (shown in the chat) |
+| `builtin` | Gemma 4 in-process (Transformers on CUDA, MLX on Apple Silicon) | always (loads in background) |
+| `anthropic` | Claude Haiku 5.5, Claude Sonnet 5.5 | `ANTHROPIC_API_KEY` |
+| `openai` | GPT-5.4 Mini | `OPENAI_API_KEY` |
+| `openai_compatible` | **Ollama, LM Studio**, llama.cpp, vLLM, OpenRouter, Groq… | `base_url` (+ optional `api_key_env`); `discover: true` lists the server's models at startup |
 
-The reply is saved when the stream completes. If the client disconnects (Stop), the partial reply is saved with `"stopped": true`. All blocking work — safety checks, routing, tools, generation — runs in a worker thread, never on the event loop.
+New local model: `ollama pull qwen3:8b` and restart — it appears in the model menu. New cloud model: add a few lines to `models.yaml`, then run the contract suite (below) to confirm it works and get the recommended `tools:` setting.
 
-### Multi-provider system
-
-The model selector in the UI lists all available models. Providers register at startup based on which API keys are present in `backend/.env`. The local model is always available regardless of network or API keys.
-
-| Provider | Models | Activation |
-|---|---|---|
-| Local (Gemma 4) | `google/gemma-4-E4B-it` | Always on (loads in background) |
-| Anthropic | Claude Haiku 4.5, Claude Sonnet 4.6 | `ANTHROPIC_API_KEY` in `.env` |
-| OpenAI | GPT-5.4 Mini | `OPENAI_API_KEY` in `.env` |
-
-> **Expensive models disabled**: Claude Opus 4.7, GPT-5.5, and GPT-5.5 Pro are defined in the provider files but commented out. To re-enable any of them, uncomment the relevant `ModelOption` line and its corresponding test assertion.
-
-All providers implement the same `BaseProvider.stream()` interface, so adding a new provider requires only a new file and three lines in `build_registry()`.
+Real token usage is read from every API response; the agent can use a cheaper model for its steps than for the final answer (Settings → Agent).
 
 ---
 
@@ -376,17 +382,7 @@ print(resp.json()["response"])
 
 ## Adding a provider
 
-1. Create `backend/src/providers/myprovider.py` subclassing `BaseProvider`. Implement `provider_name`, `models`, and `stream()`.
-2. In `backend/src/providers/registry.py`, add to `build_registry()`:
-   ```python
-   my_key = os.getenv("MY_PROVIDER_API_KEY")
-   if my_key:
-       from src.providers.myprovider import MyProvider
-       registry.register(MyProvider(my_key))
-   ```
-3. Add `MY_PROVIDER_API_KEY=` to `backend/.env`.
-
-The new models appear automatically in `GET /api/models` and the UI model selector.
+Most providers need no code: anything with an OpenAI-compatible API is an `openai_compatible` entry in `models.yaml`. For a genuinely different API, subclass `BaseProvider` (implement `models`, `stream`, `complete`, and optionally `_native_tool_turn`; prompted tool calling is inherited), record usage with `usage.record(...)`, and add a `type` branch in `build_provider()` in `src/providers/registry.py`.
 
 ---
 
@@ -394,8 +390,11 @@ The new models appear automatically in `GET /api/models` and the UI model select
 
 ```bash
 cd backend
-pytest                                          # unit tests (no GPU, no API keys)
+pytest                                                   # unit + task-runtime tests (no GPU, no API keys)
 pytest tests/test_providers_integration.py -m integration -v   # real API calls
+pytest tests/contract -m contract --model claude-haiku-5-5 --model llama3.2:3b -v   # does a model work here?
+
+cd frontend && npm test                                  # turn reducer (vitest)
 ```
 
-Unit tests mock the model and all external API clients. Integration tests pass if a valid response is received, skip if the account has insufficient credits, and fail only on authentication errors.
+Unit tests mock the model and all external API clients; `tests/fakes.py` has a scripted provider that runs the real agent loop deterministically. The **contract suite** checks a model against what the agent needs (instruction following, streaming + usage, tool calls, status lines, parallel calls, knowing when to stop, a full agent loop) in both native and prompted modes, and prints the recommended `tools:` setting. CI (`.github/workflows/tests.yml`) runs the backend unit tests and the frontend typecheck + tests on every push.

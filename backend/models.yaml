@@ -1,0 +1,102 @@
+# Model catalog — add or change models here; no code changes needed.
+#
+# Per-model fields (all optional except id):
+#   name               display name
+#   tools              native | prompted | auto
+#                        native   — provider tool-calling API
+#                        prompted — JSON reply described in the prompt (works with any text model)
+#                        auto     — try native, fall back to prompted on the first error (good for new/unknown models)
+#   vision             accepts images
+#   context_window     input tokens
+#   max_output_tokens  per-reply cap sent to the API
+#   input_price        $ per 1M input tokens   (drives cost tracking and task budgets)
+#   output_price       $ per 1M output tokens
+#   is_cheapest        candidate for utility calls (titles, memory, routing fallback)
+#   extra_body         provider-specific request fields, e.g. {output_config: {effort: low}}
+#   extra_headers      provider-specific headers, e.g. {anthropic-beta: some-beta-2026-01-01}
+#
+# Provider types:
+#   builtin            in-process model from config.yaml (Transformers on CUDA, MLX on Apple Silicon)
+#   anthropic          Anthropic Messages API
+#   openai             OpenAI Chat Completions
+#   openai_compatible  any server speaking the OpenAI API: Ollama, LM Studio, llama.cpp, vLLM, OpenRouter, Groq...
+#
+# `discover: true` lists the provider's models at startup and adds any not listed here with `defaults`.
+# A provider with `api_key_env` is only registered when that variable is set.
+
+providers:
+  local:
+    type: builtin
+
+  anthropic:
+    type: anthropic
+    api_key_env: ANTHROPIC_API_KEY
+    discover: false
+    models:
+      - id: claude-haiku-5-5
+        name: Claude Haiku 5.5
+        tools: native
+        vision: true
+        context_window: 1000000
+        max_output_tokens: 16000
+        input_price: 0.10
+        output_price: 0.50
+        is_cheapest: true
+      - id: claude-sonnet-5-5
+        name: Claude Sonnet 5.5
+        tools: native
+        vision: true
+        context_window: 1000000
+        max_output_tokens: 32000
+        input_price: 2.00
+        output_price: 10.00
+      # - id: claude-opus-5-5          # most capable Opus — uncomment to enable
+      #   name: Claude Opus 5.5
+      #   tools: native
+      #   vision: true
+      #   context_window: 1000000
+      #   max_output_tokens: 32000
+      #   input_price: 4.00
+      #   output_price: 20.00
+
+  openai:
+    type: openai
+    api_key_env: OPENAI_API_KEY
+    models:
+      - id: gpt-5.4-mini
+        name: GPT-5.4 Mini
+        tools: native
+        vision: true
+        context_window: 400000
+        max_output_tokens: 16000
+        is_cheapest: true
+        # input_price / output_price: fill in from https://openai.com/api/pricing to include in cost totals
+
+  # Local servers: models you pull (`ollama pull qwen3:8b`) show up automatically.
+  ollama:
+    type: openai_compatible
+    base_url: http://localhost:11434/v1
+    discover: true
+    defaults:
+      tools: auto
+      context_window: 32000
+      max_output_tokens: 4096
+
+  lmstudio:
+    type: openai_compatible
+    base_url: http://localhost:1234/v1
+    discover: true
+    defaults:
+      tools: auto
+      context_window: 32000
+      max_output_tokens: 4096
+
+  # openrouter:
+  #   type: openai_compatible
+  #   base_url: https://openrouter.ai/api/v1
+  #   api_key_env: OPENROUTER_API_KEY
+  #   models:
+  #     - id: deepseek/deepseek-chat
+  #       tools: auto
+  #       input_price: 0.27
+  #       output_price: 1.10

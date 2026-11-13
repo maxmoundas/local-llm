@@ -1,15 +1,22 @@
-import type { ResearchStep, SourceRef } from '../types'
+import type { AgentAction, InputRequest, SourceRef, TaskFile, Usage } from '../types'
 
-export type StreamEvent =
+/** Events of one chat turn (a background task). Every event carries a `seq` for resuming. */
+export type StreamEvent = { seq?: number } & (
+  | { type: 'task_start'; task_id: string; chat_id?: string }
   | { type: 'status'; text: string }
-  | { type: 'step'; step: ResearchStep }
+  | { type: 'action'; action: AgentAction }
   | { type: 'sources'; sources: SourceRef[] }
+  | { type: 'input_request'; request: InputRequest }
+  | { type: 'input_resolved'; request_id: string }
   | { type: 'token'; content: string }
-  | { type: 'done'; name: string }
-  | { type: 'error'; message: string }
   | { type: 'blocked'; target: 'input' | 'output'; reason?: string }
+  | { type: 'error'; message: string }
+  | { type: 'done'; name: string; files?: TaskFile[] }
+  | ({ type: 'usage' } & Usage)
+  | { type: 'task_end'; status: 'done' | 'failed' | 'cancelled' | 'interrupted' }
+)
 
-/** Read a text/event-stream response body, yielding each `data:` JSON event. */
+/** Read a text/event-stream response body, yielding each `data:` JSON event (comments/pings skipped). */
 export async function* readEvents(res: Response): AsyncGenerator<StreamEvent> {
   const reader = res.body!.getReader()
   const decoder = new TextDecoder()

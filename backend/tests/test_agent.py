@@ -7,7 +7,7 @@ import pytest
 
 from src.agent import tools as tools_mod
 from src.agent.router import ENOUGH_THRESHOLD, ResearchRouter, RouteDecision
-from src.agent.runner import ResearchAgent, build_answer_system
+from src.agent.runner import ResearchAgent, TaskAgent, build_answer_system
 from src.agent.tools import Source, Tool, ToolResult
 from src.decision_service import Answer, DecisionError, DecisionService
 from src.llm_service import LLMService
@@ -153,27 +153,31 @@ class TestRouter:
 
 # ── ResearchAgent ──────────────────────────────────────────────────────────
 
-class TestResearchAgent:
+class TestTaskAgent:
+    """Loop behaviour with a mocked LLMService (see test_task_agent.py for end-to-end runs)."""
+
     def _agent(self, turns, enough=None, tools=None, max_steps=4):
         llm = MagicMock(spec=LLMService)
         llm.complete_with_tools.side_effect = turns
         router = MagicMock(spec=ResearchRouter)
         router.enough.return_value = enough
-        return ResearchAgent(llm, router, tools or [_fake_tool()], max_steps=max_steps), llm, router
+        return TaskAgent(llm, router, tools or [_fake_tool()], max_steps=max_steps), llm, router
 
-    def test_emits_status_step_done(self):
+    def test_emits_status_action_done(self):
         agent, _, _ = self._agent([ToolTurn(tool_calls=[ToolCall("web_search", {"query": "x"})]), ToolTurn()])
         events = _events(agent)
-        types = [e.type for e in events]
-        assert types[0] == "status" and "step" in types and types[-1] == "done"
-        assert events[1].text == "Running web_search"
+        assert events[0].type == "status" and events[-1].type == "done"
+        actions = [e.action for e in events if e.type == "action"]
+        assert [a["status"] for a in actions] == ["running", "done"]
+        assert actions[0]["id"] == actions[1]["id"]
+        assert actions[0]["label"] == "Running web_search" and actions[1]["label"] == "Ran web_search"
 
-    def test_done_carries_notes_sources_steps(self):
+    def test_done_carries_notes_sources_actions(self):
         agent, _, _ = self._agent([ToolTurn(tool_calls=[ToolCall("web_search", {"query": "x"})]), ToolTurn()])
         done = _events(agent)[-1]
         assert "result" in done.notes and "Ran web_search" in done.notes
         assert done.sources == [{"title": "A", "url": "https://a.com"}]
-        assert done.steps[0]["label"] == "Ran web_search"
+        assert done.actions[0]["label"] == "Ran web_search" and done.stopped == ""
 
     def test_stops_when_jev_says_enough(self):
         turns = [ToolTurn(tool_calls=[ToolCall("web_search", {"query": "x"})])] * 4
@@ -184,8 +188,9 @@ class TestResearchAgent:
     def test_continues_when_not_enough(self):
         turns = [ToolTurn(tool_calls=[ToolCall("web_search", {"query": f"q{i}"})]) for i in range(4)]
         agent, llm, _ = self._agent(turns, enough=0.1, max_steps=3)
-        _events(agent)
+        done = _events(agent)[-1]
         assert llm.complete_with_tools.call_count == 3
+        assert done.stopped == "max_steps"
 
     def test_skips_repeated_calls(self):
         same = ToolTurn(tool_calls=[ToolCall("web_search", {"query": "x"})])
@@ -199,15 +204,16 @@ class TestResearchAgent:
         calls = [ToolCall("web_search", {"query": str(i)}) for i in range(10)]
         tool = _fake_tool()
         agent, _, _ = self._agent([ToolTurn(tool_calls=calls), ToolTurn()], tools=[tool])
-        events = _events(agent)
+        _events(agent)
         assert tool.run.call_count == 4
-        assert events[1].text.endswith("and 3 more")
 
-    def test_tool_exception_becomes_error_note(self):
+    def test_tool_exception_becomes_failed_action_and_error_note(self):
         tool = _fake_tool()
         tool.run.side_effect = RuntimeError("boom")
         agent, _, _ = self._agent([ToolTurn(tool_calls=[ToolCall("web_search", {})]), ToolTurn()], tools=[tool])
-        assert "Error: boom" in _events(agent)[-1].notes
+        done = _events(agent)[-1]
+        assert "Error: boom" in done.notes
+        assert done.actions[0]["status"] == "failed"
 
     def test_planner_failure_still_finishes(self):
         agent, _, _ = self._agent(RuntimeError("api down"))
@@ -215,7 +221,10 @@ class TestResearchAgent:
 
     def test_answer_system_wraps_notes(self):
         text = build_answer_system("BASE", "NOTE")
-        assert text.startswith("BASE") and "<research_notes>\nNOTE\n</research_notes>" in text
+        assert text.startswith("BASE") and "<work_log>\nNOTE\n</work_log>" in text
+
+    def test_answer_system_explains_early_stop(self):
+        assert "spending limit" in build_answer_system("B", "N", stopped="budget")
 
 
 class TestSearchErrors:
@@ -245,23 +254,28 @@ class TestFirstStepRequiresTools:
         requires = [c.kwargs["require"] for c in llm.complete_with_tools.call_args_list]
         assert requires == [True, False]
 
-    def test_anthropic_sets_tool_choice(self):
+    def test_anthropic_requires_by_instruction_not_forced_choice(self):
+        # Forced tool_choice ("any") is rejected by current Claude models — always auto + instruction.
         from unittest.mock import patch
         with patch("anthropic.Anthropic") as cls:
             from src.providers.anthropic_provider import AnthropicProvider
             cls.return_value.messages.create.return_value = MagicMock(content=[])
             p = AnthropicProvider("k")
             p.complete_with_tools([{"role": "user", "content": "q"}], "m", [_fake_tool().spec], require=True)
-            assert cls.return_value.messages.create.call_args.kwargs["tool_choice"] == {"type": "any"}
+            kwargs = cls.return_value.messages.create.call_args.kwargs
+            assert kwargs["tool_choice"] == {"type": "auto"}
+            assert "must call at least one tool" in kwargs["system"][0]["text"]
 
-    def test_openai_sets_tool_choice(self):
+    def test_openai_requires_by_instruction(self):
         from unittest.mock import patch
         with patch("src.providers.openai_provider.OpenAI") as cls:
             from src.providers.openai_provider import OpenAIProvider
             msg = MagicMock(content="", tool_calls=[])
             cls.return_value.chat.completions.create.return_value = MagicMock(choices=[MagicMock(message=msg)])
             OpenAIProvider("k").complete_with_tools([{"role": "user", "content": "q"}], "m", [_fake_tool().spec], require=True)
-            assert cls.return_value.chat.completions.create.call_args.kwargs["tool_choice"] == "required"
+            kwargs = cls.return_value.chat.completions.create.call_args_list[0].kwargs
+            assert kwargs["tool_choice"] == "auto"
+            assert "must call at least one tool" in kwargs["messages"][0]["content"]
 
     def test_prompted_fallback_adds_instruction(self):
         from src.providers.base import BaseProvider
@@ -277,3 +291,25 @@ class TestFirstStepRequiresTools:
         p = P()
         p.complete_with_tools([{"role": "user", "content": "q"}], "m", [_fake_tool().spec], require=True)
         assert "must call at least one tool" in p.sys
+
+
+class TestLenientPromptedParsing:
+    def test_missing_closing_brackets(self):
+        raw = '{"tool_calls": [{"name": "run_code", "arguments": {"code": "print(1)"}}'
+        assert parse_prompted_tool_turn(raw, {"run_code"}).tool_calls[0].arguments == {"code": "print(1)"}
+
+    def test_raw_newlines_inside_strings(self):
+        raw = '{"tool_calls": [{"name": "run_code", "arguments": {"code": "a = 1\nprint(a)"}}]}'
+        assert parse_prompted_tool_turn(raw, {"run_code"}).tool_calls[0].arguments["code"] == "a = 1\nprint(a)"
+
+    def test_trailing_prose_after_json(self):
+        raw = '{"tool_calls": [{"name": "web_search", "arguments": {"query": "x"}}]} Let me know!'
+        assert parse_prompted_tool_turn(raw, {"web_search"}).tool_calls[0].name == "web_search"
+
+    def test_single_bare_call_object(self):
+        raw = '{"name": "web_search", "arguments": {"query": "x"}}'
+        assert parse_prompted_tool_turn(raw, {"web_search"}).tool_calls[0].arguments == {"query": "x"}
+
+    def test_stringified_arguments(self):
+        raw = '{"tool_calls": [{"name": "web_search", "arguments": "{\\"query\\": \\"x\\"}"}]}'
+        assert parse_prompted_tool_turn(raw, {"web_search"}).tool_calls[0].arguments == {"query": "x"}

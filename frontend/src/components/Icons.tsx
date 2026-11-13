@@ -45,3 +45,10 @@ export const SparkIcon = (p: IconProps) => (
   <Icon {...p}><path fill="currentColor" stroke="none" d="M12 2.5c.5 4.6 2.4 7 7.5 9.5-5.1 2.5-7 4.9-7.5 9.5-.5-4.6-2.4-7-7.5-9.5 5.1-2.5 7-4.9 7.5-9.5Z" /></Icon>
 )
 export const MenuIcon = (p: IconProps) => <Icon {...p}><path d="M4 7h16M4 12h16M4 17h16" /></Icon>
+export const CodeIcon = (p: IconProps) => <Icon {...p}><path d="m8 8-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14" /></Icon>
+export const FileIcon = (p: IconProps) => <Icon {...p}><path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8l-5-5Z" /><path d="M14 3v5h5" /></Icon>
+export const PlugIcon = (p: IconProps) => <Icon {...p}><path d="M9 3v5M15 3v5M6 8h12v3a6 6 0 0 1-12 0V8ZM12 17v4" /></Icon>
+export const QuestionIcon = (p: IconProps) => <Icon {...p}><circle cx="12" cy="12" r="9" /><path d="M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.6.3-1 .9-1 1.6v.6M12 17h.01" /></Icon>
+export const HandIcon = (p: IconProps) => <Icon {...p}><path d="M8 13V5.5a1.5 1.5 0 0 1 3 0V11M11 10.5V4a1.5 1.5 0 0 1 3 0v6.5M14 10.5V6a1.5 1.5 0 0 1 3 0v8a6 6 0 0 1-6 6h-.5a6 6 0 0 1-4.6-2.2L3.6 15a1.5 1.5 0 0 1 2.3-1.9L8 15" /></Icon>
+export const SlashIcon = (p: IconProps) => <Icon {...p}><circle cx="12" cy="12" r="9" /><path d="m5.6 5.6 12.8 12.8" /></Icon>
+export const DownloadIcon = (p: IconProps) => <Icon {...p}><path d="M12 4v11M7 10.5 12 15.5l5-5M5 20h14" /></Icon>
