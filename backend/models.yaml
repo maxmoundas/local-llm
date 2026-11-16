@@ -11,7 +11,8 @@
 #   max_output_tokens  per-reply cap sent to the API
 #   input_price        $ per 1M input tokens   (drives cost tracking and task budgets)
 #   output_price       $ per 1M output tokens
-#   is_cheapest        candidate for utility calls (titles, memory, routing fallback)
+#   is_cheapest        candidate for utility calls (titles, memory, routing fallback). The built-in local
+#                      model is never picked automatically; choose it in Settings → Models if you want it.
 #   temperature        accepts a sampling temperature (per-chat setting). Default true; current Claude
 #                      and GPT-5 models reject it.
 #   effort             accepts a reasoning-effort level (low | medium | high, per-chat setting)

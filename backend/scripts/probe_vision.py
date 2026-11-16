@@ -4,8 +4,8 @@ Minimal Gemma 4 vision probe — same loading path as text inference,
 with an image added to the message.
 
 Usage (from the backend/ directory):
-    python probe_vision.py
-    python probe_vision.py tests/images/dog.png
+    python scripts/probe_vision.py
+    python scripts/probe_vision.py tests/images/dog.png
 """
 from __future__ import annotations
 

@@ -24,6 +24,17 @@ describe('normalizeMath', () => {
   it('treats $ before a digit as currency', () => {
     expect(normalizeMath('Budget is $42k but **$30k** here')).toBe('Budget is \\$42k but **\\$30k** here')
     expect(normalizeMath('area $x^2$ and $$2x$$')).toBe('area $x^2$ and $$2x$$')
+    expect(normalizeMath('between $10 and $20.')).toBe('between \\$10 and \\$20.')
+    expect(normalizeMath('$5 - $10 per seat')).toBe('\\$5 - \\$10 per seat')
+    expect(normalizeMath('It costs $5 and the other one $')).toBe('It costs \\$5 and the other one $')
+    expect(normalizeMath('Pay $5 to solve $x^2$')).toBe('Pay \\$5 to solve $x^2$')
+    expect(normalizeMath('Revenue hit $1.2M, up from $900k')).toBe('Revenue hit \\$1.2M, up from \\$900k')
+  })
+  it('keeps inline math that starts with a digit', () => {
+    expect(normalizeMath('solve $2x^2 + 5x - 3 = 0$.')).toBe('solve $2x^2 + 5x - 3 = 0$.')
+    expect(normalizeMath('so $3x + 2$ grows')).toBe('so $3x + 2$ grows')
+    expect(normalizeMath('ratio $2\\pi r$ here')).toBe('ratio $2\\pi r$ here')
+    expect(normalizeMath('just $2x$ and $5 cash')).toBe('just $2x$ and \\$5 cash')
   })
   it('leaves code alone', () => {
     const src = 'use `\\(x\\)` and\n```\n\\[y\\]\n```'

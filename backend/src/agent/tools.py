@@ -283,7 +283,9 @@ def _get_weather(args: dict) -> ToolResult:
                      f"low {d['temperature_2m_min'][i]}{t_unit}, chance of precipitation {d['precipitation_probability_max'][i]}%")
     return ToolResult(
         text="\n".join(lines),
-        sources=[Source(title=f"Open-Meteo forecast — {label}", url="https://open-meteo.com/")],
+        # A per-place URL, so a multi-city answer cites each forecast instead of one de-duplicated link.
+        sources=[Source(title=f"Open-Meteo forecast — {label}",
+                        url=f"https://open-meteo.com/en/docs?latitude={place['latitude']}&longitude={place['longitude']}")],
         summary=f"{cur['temperature_2m']}{t_unit}, {_WMO.get(cur['weather_code'], '')}",
     )
 

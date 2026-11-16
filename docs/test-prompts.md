@@ -80,6 +80,6 @@ The second answer should use what it learned. View and edit memory in **Settings
 
 ## 8. Settings off-switches
 
-- **Settings → Research → off:** the Nashville prompt answers directly, with no status box.
-- **Settings → Jev → off:** research still works, but the routing decision falls back to Haiku,
+- **Settings → Agent → off:** the Nashville prompt answers directly, with no status box.
+- **Settings → Jev → off:** research still works, but the routing decision falls back to the utility (cheapest) model,
   so expect it to be slightly slower.

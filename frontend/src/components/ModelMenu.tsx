@@ -53,11 +53,13 @@ export default function ModelMenu({ models, selected, onChange, localModelLoaded
                     role="option"
                     aria-selected={m.id === selected}
                     className="model-menu-item"
-                    disabled={loading}
+                    disabled={loading || !!m.error}
+                    title={m.error}
                     onClick={() => { onChange(m.id); setOpen(false) }}
                   >
                     <span className="model-menu-item-name">{m.name}</span>
                     {loading && <span className="model-menu-item-note">loading…</span>}
+                    {m.error && <span className="model-menu-item-note">check API key</span>}
                     {m.id === selected && <CheckIcon size={15} className="model-menu-check" />}
                   </button>
                 )

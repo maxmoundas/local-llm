@@ -56,12 +56,23 @@ const components: Components = {
   table: ({ children }) => <div className="table-wrap"><table>{children}</table></div>,
 }
 
+/** A `$` right before a digit is usually money ("$42k … $30k") and is escaped, unless it opens inline math
+ * like $2x^2 + 5x - 3 = 0$: a closing `$` on the same line, not right after whitespace and not right before a
+ * digit (as the next price would be), around math-looking content (no spaces, or an operator). */
+function escapeMoney(text: string): string {
+  return text.replace(/(?<![\\$])\$(?=(\d[^$\n]*)(\$?))/g, (dollar, body: string, close: string, at: number) => {
+    const after = text[at + 1 + body.length + close.length] ?? ''
+    const math = close === '$' && !/\s$/.test(body) && !/\d/.test(after)
+      && (!/\s/.test(body) || /[\^_\\={}<>+\-*/]/.test(body))
+    return math ? dollar : '\\$'
+  })
+}
+
 /** Models often write \( … \) and \[ … \]; remark-math only knows $ … $ and $$ … $$ (and treats a one-line
- * $$ … $$ as inline). Normalize to what it renders as display math. A `$` right before a digit is money
- * ("$42k … $30k"), not math, so it's escaped. Code is left alone. */
+ * $$ … $$ as inline). Normalize to what it renders as display math, and escape `$` used for money.
+ * Code is left alone. */
 export function normalizeMath(src: string): string {
-  return src.split(/(```[\s\S]*?(?:```|$)|`[^`\n]*`)/g).map((part, i) => (i % 2 === 1 ? part : part
-    .replace(/(?<![\\$])\$(?=\d)/g, '\\$')
+  return src.split(/(```[\s\S]*?(?:```|$)|`[^`\n]*`)/g).map((part, i) => (i % 2 === 1 ? part : escapeMoney(part)
     .replace(/^[ \t]*\$\$([^\n]+?)\$\$[ \t]*$/gm, (_, m) => `$$\n${m.trim()}\n$$`)
     .replace(/\\\[([\s\S]+?)\\\]/g, (_, m) => `\n$$\n${m.trim()}\n$$\n`)
     .replace(/\\\(([\s\S]+?)\\\)/g, (_, m) => `$${m.trim()}$`))).join('')

@@ -21,6 +21,7 @@ zip can't write outside these folders (zip-slip), and sizes are capped (zip bomb
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -65,7 +66,9 @@ def _add_tree(zf: zipfile.ZipFile, base: Path, arc_prefix: str, pattern: re.Patt
 
 def create_backup() -> Path:
     """Write a backup zip to a temporary file and return its path (the caller deletes it)."""
-    out = Path(tempfile.mkstemp(prefix="local-llm-backup-", suffix=".zip")[1])
+    fd, name = tempfile.mkstemp(prefix="local-llm-backup-", suffix=".zip")
+    os.close(fd)  # an open handle would stop the caller deleting the file on Windows
+    out = Path(name)
     any_chat = re.compile(rf"^chats/(?:{_UUID}\.json|{_UUID}/files/{_FILE})$")
     any_project = re.compile(rf"^projects/(?:{_UUID}\.json|{_UUID}/(?:files/{_FILE}|memory\.txt))$")
     with chat_store._lock, project_store._lock, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:

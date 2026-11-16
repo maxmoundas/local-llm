@@ -179,6 +179,8 @@ class TaskAgent:
         failed_steps = 0
         stopped = ""
         log_budget = self._log_budget(model_id)
+        act_specs = [s for s in specs if s is not _PLAN_TOOL]
+        just_planned = False  # last turn only updated the plan, so this one must act
 
         for step_no in range(1, self._max_steps + 1):
             stopped = self._limit_hit(ctl)
@@ -190,8 +192,12 @@ class TaskAgent:
             try:
                 # The router already decided tools are needed, so the first turn must act —
                 # otherwise a model can talk itself out of looking ("the earlier reply covered it").
-                turn = self._llm.complete_with_tools(messages, model_id, specs, context_id=context_id,
-                                                     require=require_first and step_no == 1)
+                # After a plan-only turn the plan tool is withheld: a plan adds nothing to the work log, so
+                # some models would otherwise re-plan every turn until the step limit without acting.
+                turn = self._llm.complete_with_tools(
+                    messages, model_id, act_specs if just_planned else specs, context_id=context_id,
+                    require=(require_first and step_no == 1) or just_planned)
+                just_planned = False
             except RefusalError:
                 raise
             except Exception as exc:
@@ -210,6 +216,7 @@ class TaskAgent:
             calls = calls[:MAX_CALLS_PER_STEP]
             if not calls:
                 if any(c.name in ("update_plan", "ask_user") for c in turn.tool_calls):
+                    just_planned = any(c.name == "update_plan" for c in turn.tool_calls)
                     continue  # planning / asking counts as a turn; go again
                 break
             seen_calls.update(_call_key(c) for c in calls)

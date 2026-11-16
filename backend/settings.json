@@ -1,5 +1,5 @@
 {
-  "cheapest_model_id": "google/gemma-4-E4B-it",
+  "cheapest_model_id": null,
   "system_prompt": "You are a helpful, knowledgeable, and thoughtful AI assistant. Provide accurate, well-structured answers \u2014 concise for simple questions, detailed when depth is warranted. Acknowledge uncertainty rather than guessing. For code, include working examples and briefly explain non-obvious decisions.",
   "memory_enabled": true,
   "guardrails_enabled": false,

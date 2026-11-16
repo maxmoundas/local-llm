@@ -4,7 +4,7 @@ Download a Gemma (or any HuggingFace) model with progress display.
 
 Usage:
     python scripts/download_model.py
-    python scripts/download_model.py --repo-id google/gemma-4-4b-it
+    python scripts/download_model.py --repo-id google/gemma-4-E4B-it
     python scripts/download_model.py --token hf_xxxx
 """
 from __future__ import annotations

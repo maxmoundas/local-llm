@@ -28,7 +28,7 @@ class LocalProvider(BaseProvider):
         if getattr(self, "_model_option", None) is None or self._model_option.id != self._llm.repo_id:
             # Prompted tool calls: in-process models have no tool-calling API.
             self._model_option = ModelOption(
-                id=self._llm.repo_id, name=short_name, provider="local", is_cheapest=True, tools="prompted",
+                id=self._llm.repo_id, name=short_name, provider="local", is_cheapest=False, tools="prompted",
                 vision=getattr(self._llm, "supports_vision", True),
                 max_output_tokens=int(getattr(self._llm, "cfg", {}).get("max_new_tokens", 2048) or 2048),
             )

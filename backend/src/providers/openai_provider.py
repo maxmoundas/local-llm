@@ -59,6 +59,7 @@ class OpenAICompatibleProvider(BaseProvider):
                  models: list[ModelOption] | None = None, discover: bool = False,
                  discovered_defaults: dict | None = None, timeout: float = 600.0) -> None:
         self._name = name
+        self._has_key = bool(api_key)
         self._client = OpenAI(api_key=api_key or "not-needed", base_url=base_url, timeout=timeout)
         self._models = list(models or [])
         self._base_url = base_url
@@ -81,6 +82,10 @@ class OpenAICompatibleProvider(BaseProvider):
                 continue
             self._models.append(ModelOption(id=item.id, name=item.id, provider=self._name, **defaults))
         _log.info("Discovered %d model(s) on %s", len(listed), self._name)
+
+    def check_auth(self) -> None:
+        if self._has_key:  # keyless local servers (Ollama, LM Studio) have nothing to check
+            self._probe_auth(lambda: self._client.with_options(timeout=5.0, max_retries=0).models.list())
 
     @property
     def provider_name(self) -> str:

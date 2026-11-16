@@ -1,491 +1,192 @@
 # Local LLM
 
-A self-hosted, Claude-style chat app for running Google Gemma 4 locally, with Anthropic and OpenAI cloud models through a unified provider system, multi-step web research, and fast structured decisions from TypeSafe's Jev. The backend exposes an OpenAI-compatible API so it can drop into any project already using the OpenAI SDK.
+**A private, self-hosted AI assistant that runs open models on your own GPU, with web research, code execution, and
+tool connectors. Cloud models are optional.**
 
-**Default model**: `google/gemma-4-E4B-it` (8B parameters, ~5 GB at 4-bit quantization, fits on an RTX 4070 SUPER with headroom).
+![A chat in Local LLM](docs/screenshots/chat.png)
 
-## Features at a glance
+Local LLM is a full chat app (React frontend + FastAPI backend) built around a model that runs **on your machine**.
+Your chats, files, and memory stay on your disk. When you want more power, the same interface can use Ollama,
+LM Studio, any OpenAI-compatible server, or cloud models from Anthropic and OpenAI, all from one model menu.
 
-- **Chat** — streaming Markdown with math (KaTeX) and code highlighting; **regenerate** any reply and **edit-and-resend**
-  any message, with ‹ 1 / 2 › switching between versions; export a chat as Markdown or JSON; "Generate title".
-- **Attachments** — several images and documents per message (PDF, Word, Excel, CSV, text, code). Images are saved
-  with the chat and stay visible to vision models in follow-ups; document text goes to the model, and the files are
-  copied into the agent's workspace so code can work on them.
-- **Long chats** — history is fitted to each model's context window; older turns are summarized by the utility model.
-- **Projects** — groups of chats sharing instructions, knowledge files, and their own memory.
-- **Per-chat settings** — a custom system prompt, temperature (models that accept one), and reasoning effort (Claude, GPT-5).
-- **Search** — full text over every message (SQLite FTS5 index, any substring), with snippets; jumps to the matching message.
-- **Previews** — HTML, SVG, and Mermaid code blocks open in a side panel; files the agent creates (images, CSV as a
-  table, text, Markdown, HTML) preview inline instead of only downloading.
-- **Scheduled tasks** — prompts that run daily, on chosen weekdays, or every N minutes, each posting to its own chat.
-- **Usage** — spend by day, model, and chat (including memory extraction, titles, and `/v1` calls), plus an optional
-  monthly limit that pauses new turns.
-- **Backup & restore** — one zip with chats, files, projects, memory, settings, and schedules (Settings → General).
-- **One-process mode** — `./start.sh --prod` builds the UI and the backend serves it at http://localhost:8000.
-- **Voice input** — local speech-to-text with Whisper (`faster-whisper`), no cloud calls.
-- **Keyboard shortcuts** — ⌘/Ctrl+Shift+O new chat, ⌘K search, ⌘B sidebar, Shift+Esc focus input, ⌘/ for the list.
-- **Safe by default on the network** — loopback-only unless you set an access token (see [Security](#security)).
+## Highlights
 
----
+- **Runs locally when you want it to.** Includes Google **Gemma 4 E4B** (4-bit, about 5 GB of VRAM), off by default.
+  It runs on CUDA GPUs, where it can also read images, and on Apple Silicon (via MLX, text only for now).
+- **An agent, not just a chatbot.** When a question needs it, the assistant plans, searches the web, reads pages,
+  checks the weather, runs code in a Docker sandbox, and cites its sources. You can watch each step live.
+- **Bring any model.** Local models from Ollama and LM Studio show up automatically. You can add cloud or
+  OpenAI-compatible models in `models.yaml` without touching code.
+- **Connectors (MCP).** Plug in any [Model Context Protocol](https://modelcontextprotocol.io) server (files, GitHub,
+  email, calendar). Risky actions wait for your approval.
+- **Everything you expect from a chat app.** Markdown, math, and code rendering; editing and regenerating replies,
+  with version history; image and document attachments (PDF, Word, Excel); projects; full-text search; scheduled
+  prompts; memory; voice input (local Whisper); live HTML, SVG, and Mermaid previews; light and dark themes.
+- **OpenAI-compatible API.** Point any OpenAI SDK script at `http://localhost:8000/v1` to use every configured model.
+- **Safe defaults.** Listens on localhost only. Code runs in a sandbox, prompt-injection guards protect tools that
+  send data out, an optional access token protects LAN use, and spending limits cap cloud models.
 
-## Architecture
+## Screenshots
 
-```
-Browser (React/Vite)
-        |
-        | HTTP + SSE
-        v
-FastAPI backend (:8000)
-        |
-   ProviderRegistry
-   /       |       \
-Local   Anthropic   OpenAI
-(GPU)    (API key)  (API key)
-```
-
-### Backend
-
-The backend is a FastAPI application (`backend/serve.py`) running on port 8000.
-
-**`src/model.py`** -- `LocalLLM` class. Loads the model via HuggingFace Transformers with 4-bit NF4 quantization (bitsandbytes). Supports text-only and vision (image + text) inputs. Exposes `generate()` and `stream()` methods; vision variants use `generate_with_image()` and `stream_with_image()`.
-
-**`src/providers/`** -- Provider abstraction layer.
-
-- `BaseProvider` (ABC): `stream`, `complete`, and `complete_with_tools` (native tool calling where the provider has it, prompted JSON with lenient parsing and one repair retry otherwise).
-- `LocalProvider`: wraps the in-process model (`model_factory.py` picks Transformers/CUDA or MLX/Apple Silicon). Returns a descriptive error if a request arrives before the model finishes loading.
-- `AnthropicProvider` / `OpenAICompatibleProvider`: cloud APIs and any OpenAI-compatible server (Ollama, LM Studio, OpenRouter…). Both record real token usage and cache the system prompt where supported.
-- `ProviderRegistry`: built from `models.yaml` by `build_registry()`; maps model IDs to providers and picks the cheapest ready model for utility calls.
-
-**`src/server.py`** -- FastAPI routes. On startup the registry is built (cloud and local-server models available at once), the in-process model loads in a background thread, and MCP connectors start. Each message runs as a background task (`src/tasks/`) whose events stream over SSE. Also exposes OpenAI-compatible `/v1/chat/completions` and `/v1/models` endpoints.
-
-**`src/chat_store.py`** -- Chat persistence (see below).
-
-**`src/config.py`** -- Loads `backend/config.yaml`. Any key can be overridden with environment variables (`MODEL_REPO_ID`, `MODEL_QUANTIZATION`, `SERVER_PORT`, `LOG_LEVEL`).
-
-**`src/logger.py`** -- Rotating file logger (10 MB per file, 5 backups) with optional console output, written to `backend/logs/`.
-
-### Agent (research, code, connectors)
-
-When a message needs tools, the assistant works on it step by step as a **background task**: it plans, calls tools (several in parallel), reads the results, and repeats until done, then writes the answer. Images can be attached to such messages too: the planner can't see them, but they're copied into the workspace for code, and the vision model that writes the answer sees them. Each step shows as a one-line update ("Searching the web for “…”", "Running code: load sales.csv", "Reading nytimes.com") in an animated timeline. Tasks keep running if the tab closes; reopening the chat reattaches to the live task.
-
-```
-message ─► router ── no ──► answer directly
-              │ yes
-              ▼
-        ┌─► planner (tool calls, any model) ─► tools in parallel ─► work log ─┐
-        │                                                                     │
-        └── continue ◄── limits: steps · $ budget · time · cancel ◄──────────┘
-                                   │ done / limit hit
-                                   ▼
-                     answer streamed from the work log (+ sources, files)
-```
-
-- **`src/agent/runner.py`** — `TaskAgent`. Stateless turns over a rendered work log, so every model (native or prompted tool calling) runs the same loop. Every tool gets an optional `status` argument the model fills with the user-facing line (no extra LLM calls); templates are the fallback. Internal tools: `update_plan` (a private plan) and `ask_user` (pauses for your answer). Old log entries are trimmed, then folded into a summary by the cheapest model when the log outgrows the model's context. Stops on step, spending, and time limits, or after repeated failures.
-- **`src/agent/tools.py`** — free, keyless research tools: `web_search`, `news_search`, `fetch_page`, `get_weather`.
-- **`src/agent/sandbox.py` + `workspace_tools.py`** — `run_code` (python, bash, and javascript where the sandbox has Node — the default `python:3.12-slim` image doesn't, so Docker offers python and bash), `write_file`, `read_file`, `list_files` in a per-task workspace. Code runs in a Docker container per task (CPU/memory/pid limits, no host env vars, network optional); files the agent creates appear as downloads under the answer. Without Docker, code tools are off unless you choose the unsandboxed "Local" mode in Settings. Workspaces are deleted with their chat and after 30 days (Settings → Agent → *Keep files the agent creates*); containers left behind by a crash are removed at startup.
-- **Prompt-injection guard** — web pages and connector data (email, issues…) can carry instructions aimed at the model. Once a task has read any, tools that can send data out — `run_code` with internet access, and connector tools whose server doesn't mark them read-only — pause for your **Allow / Deny**, with the reason shown. Scheduled runs decline them. Toggle: Settings → Agent → *Ask before sending data out*. (Web searches and page fetches themselves are not gated.)
-- **`src/agent/connectors.py`** — MCP servers from `backend/connectors.yaml` (see `connectors.example.yaml`) become tools for any model: email, calendar, GitHub, files… Tools matching a `confirm` pattern pause for your **Allow / Deny** before running.
-- **`src/agent/router.py`** — decides per message whether tools are needed (Jev, or the utility model), and whether research notes are already sufficient.
-- **`src/tasks/`** — `TaskManager` runs each turn on its own thread with an append-only event log (SQLite, `data/tasks.db`); `turn.py` is the per-message flow (guardrails → routing → agent → answer → title).
-
-Settings → **Agent**: max steps, spending and time limits per task, a separate (cheap) model for agent steps, code execution mode, and connector status.
-
-### Jev (TypeSafe System One)
-
-**`src/decision_service.py`** wraps [Jev](https://docs.typesafe.ai/introduction), a model that answers typed questions (`noul` yes/no probability, `choice`, `score`) about a state in a few hundred milliseconds instead of generating text. It is used for the app's quick decisions:
-
-| Use | Jev question(s) | Fallback when Jev is off/unavailable |
-|---|---|---|
-| Research routing | needs fresh/external info? · notes sufficient? | utility-model yes/no · planner decides when to stop |
-| Safety checks | jailbreak · harmful request · self-harm · denied topics (one noul each) + harm-severity score, thresholded by a strict/permissive policy | utility model with the editable JSON prompt |
-| Memory gating | does this message hold a lasting fact about the user? (skip extraction below 0.4) | always run extraction |
-
-Self-harm signals route to a supportive response (a system note with crisis resources) rather than a block. Call Jev from anywhere in the backend with `decision_service.get().ask(state, questions)`, or over HTTP with `POST /api/decide` (same request shape as TypeSafe's `/v1/systemone`). Every use can be switched off in **Settings → Jev**; set `TYPESAFE_API_KEY` in `backend/.env` to enable it.
-
-### Frontend
-
-React + TypeScript + Vite, styled after the Claude app (warm neutrals, serif responses, light and dark themes that follow the OS or can be forced in **Settings → General**). Vite proxies `/api`, `/health`, and `/v1` to the backend.
-
-- `App.tsx` -- layout and top-level state. The new-chat screen creates the chat on first send. Switching models keeps the current chat; the last-used model is remembered.
-- `ChatView.tsx` -- message list and SSE consumer (`lib/sse.ts`); follows the stream while you're at the bottom; **Stop** aborts the request and the partial reply is kept.
-- `Message.tsx` / `Markdown.tsx` -- user bubbles, assistant prose (GFM tables, code blocks with copy).
-- `Activity.tsx` -- the live status line while the agent works, the step list and source chips, and the question / approval cards.
-- `Composer.tsx` / `ModelMenu.tsx` -- input card with image attach/paste/drop, model menu, send/stop.
-- `Sidebar.tsx` -- collapsible; New chat, full-text Search, Scheduled, Projects, Starred, Recents, per-chat menu (star, rename, generate title, move to project, export, delete).
-- `ProjectView.tsx` / `SchedulesView.tsx` -- project page (instructions, files, memory, chats) and scheduled tasks.
-- `PreviewPanel.tsx` -- side panel for HTML/SVG/Mermaid code and agent files (sandboxed iframes; no access to the app).
-- `ChatSettingsMenu.tsx` -- per-chat system prompt, temperature, and reasoning effort.
-- `SettingsView.tsx` / `UsageTab.tsx` -- General (incl. voice, network status, backup & restore), Usage, Agent, Jev, Safety, Memory, Models.
-
-### Chat persistence
-
-Each conversation is stored as a JSON file in `backend/chats/`, named by UUID (`{chat_id}.json`), with its attached files in `backend/chats/{chat_id}/files/` (original + extracted text + metadata). Projects live in `backend/projects/`, schedules in `backend/data/schedules.json`. The only databases are the task log (`data/tasks.db`, which also holds usage) and the search index (`chats/search.db`, rebuilt from the chat files if deleted). The schema per chat file:
-
-```json
-{
-  "id": "uuid",
-  "name": "Chat title",
-  "created_at": "2026-01-01T00:00:00+00:00",
-  "updated_at": "2026-01-01T00:00:00+00:00",
-  "model_id": "claude-haiku-4-5-20251001",
-  "pinned": false,
-  "project_id": "uuid (optional)",
-  "settings": { "system_prompt": "...", "temperature": 0.7, "effort": "low" },
-  "context_summary": { "upto": 40, "fp": "…", "text": "summary of messages[:40]" },
-  "messages": [
-    { "role": "user",      "content": "...",
-      "attachments": [{ "id": "…", "name": "report.pdf", "mime": "application/pdf", "size": 12345, "kind": "document" }] },
-    { "role": "assistant", "content": "...",
-      "steps":   [{ "tool": "web_search", "label": "Searched the web for “…”", "summary": "6 results" }],
-      "sources": [{ "title": "...", "url": "https://..." }],
-      "stopped": true }
-  ]
-}
-```
-
-`steps`, `sources`, and `stopped` are display-only and stripped before history is sent to a model.
-
-**Versions.** `messages` is always the path being shown. A message with alternatives (from regenerate or edit) carries
-`versions` — the *other* conversation tails starting at that position — and `version_index`, where the shown one sits.
-Tails nest, so the full tree is stored as its visible path. `POST /api/chats/{id}/versions` switches between them. `model_id` records the last model used. The title is generated by the utility model after the first exchange and can be renamed from the sidebar menu or by clicking the title.
-
-### Streaming (SSE)
-
-`POST /api/chats/{id}/message` starts the turn as a background task (id in the `X-Task-Id` header) and streams its events. Each event is `id: <seq>` + a JSON `data:` line. Disconnecting does **not** stop the task: resume with `GET /api/tasks/{id}/events?after=<last seq>`, find a chat's running task with `GET /api/chats/{id}/active`, stop it with `POST /api/tasks/{id}/cancel`.
-
-| Event type | Description |
+| Agent steps run in parallel, with sources | Live HTML / SVG / Mermaid previews |
 |---|---|
-| `task_start` | `{ task_id }` — first event |
-| `status` | one-line status between steps ("Thinking", "Writing the answer") |
-| `action` | `{ action: { id, tool, kind, label, status, summary, started, ended } }` — a tool call; sent when it starts (`running`/`waiting`) and again when it ends (`done`/`failed`/`denied`). Upsert by `id`. |
-| `sources` | `{ sources: [{ title, url }] }` |
-| `input_request` / `input_resolved` | the agent is waiting on a question or approval — answer with `POST /api/tasks/{id}/reply` |
-| `token` | `{ content }` — answer text (not persisted; a reconnect to a live task replays them) |
-| `blocked` / `error` | stopped by a safety check / something failed |
-| `done` | `{ name, files }` — chat title and files created |
-| `usage` | tokens and `cost_usd` for the whole turn |
-| `task_end` | `{ status: done \| failed \| cancelled \| interrupted }` — last event |
+| ![Research](docs/screenshots/research.png) | ![Preview](docs/screenshots/preview.png) |
+| **Math rendering and dark mode** | **Every configured model in one menu** |
+| ![Dark mode](docs/screenshots/dark.png) | ![Models](docs/screenshots/models.png) |
 
-The frontend rebuilds a turn by folding these events (`frontend/src/lib/turn.ts`), so live view, reconnects, and reloads all show the same thing.
+<details>
+<summary>Agent settings</summary>
 
-### Multi-provider system (models.yaml)
+![Agent settings](docs/screenshots/settings-agent.png)
 
-Every model comes from **`backend/models.yaml`** — no code changes to add one. Each entry records its provider, tool-calling mode (`native`, `prompted` JSON, or `auto` = try native, fall back), vision, context window (used to fit long chats), max output, price per 1M tokens (used for cost tracking, task budgets, and the monthly limit), and which per-chat options it accepts (`temperature`, `effort`).
+</details>
 
-| Provider type | Examples | Activation |
-|---|---|---|
-| `builtin` | Gemma 4 in-process (Transformers on CUDA, MLX on Apple Silicon) | always (loads in background) |
-| `anthropic` | Claude Haiku 5.5, Claude Sonnet 5.5 | `ANTHROPIC_API_KEY` |
-| `openai` | GPT-5.4 Mini | `OPENAI_API_KEY` |
-| `openai_compatible` | **Ollama, LM Studio**, llama.cpp, vLLM, OpenRouter, Groq… | `base_url` (+ optional `api_key_env`); `discover: true` lists the server's models at startup |
+## Models and the road ahead
 
-New local model: `ollama pull qwen3:8b` and restart — it appears in the model menu. New cloud model: add a few lines to `models.yaml`, then run the contract suite (below) to confirm it works and get the recommended `tools:` setting.
+The default local model is **[Gemma 4 E4B](https://huggingface.co/google/gemma-4-E4B-it)**. Right now it's the best
+balance of speed, quality, vision, and memory use for a single consumer GPU (it was built and tested on an RTX 4070
+SUPER with 12 GB). You can switch to any other Hugging Face model in `backend/config.yaml`, or run models through
+Ollama or LM Studio.
 
-Real token usage is read from every API response; the agent can use a cheaper model for its steps than for the final answer (Settings → Agent).
+> **Local models are improving fast.** This project's goal is to give you the best assistant that runs **entirely on
+> your own hardware**. As stronger open models are released, and as quantization and inference get faster, the
+> project will add support for and move its defaults to whichever local models offer the best mix of
+> **speed and intelligence**. The agent, tools, and UI are model-agnostic, so each new model gets every feature
+> for free.
 
----
+**Today's default:** local models are not yet as fast or capable as cloud models, so the built-in local model is
+**off by default**. It isn't loaded and uses no GPU memory until you turn it on (see
+[Enable the built-in local model](#optional-enable-the-built-in-local-model)). Out of the box, chats and background tasks
+(titles, memory, routing) use the cloud models (Claude, GPT) or local servers (Ollama, LM Studio) you configure.
+Even when it's enabled, the app never picks Gemma on its own. It runs only when you choose it in the model menu, or
+set it as the utility model in **Settings → Models**.
 
-## Requirements
+## Quick start
 
-| Dependency | Version |
+### Requirements
+
+| | |
 |---|---|
 | Python | 3.11+ |
-| Node.js | 18+ |
-| CUDA | 12+ |
-| VRAM | 8 GB minimum, 12 GB recommended |
+| Node.js | 22.12+ |
+| Models | At least one of: an Anthropic or OpenAI API key, Ollama / LM Studio running, or the built-in local model |
+| Optional | Docker (sandboxed code execution); for the built-in model, an NVIDIA GPU with CUDA 12+ and 8 GB VRAM (12 GB recommended), or Apple Silicon |
 
-Python packages are in `backend/requirements.txt`. Attachments use `pypdf`, `python-docx`, and `openpyxl`; voice
-input uses `faster-whisper` (optional — without it the microphone button is hidden; the first use downloads the
-Whisper model chosen in Settings → General).
-
-> **Note**: Gemma 4 support requires `transformers` from source until it ships in a stable release:
-> ```
-> pip install git+https://github.com/huggingface/transformers.git
-> ```
-
----
-
-## Project layout
-
-```
-local-llm/
-├── backend/
-│   ├── src/
-│   │   ├── server.py             # FastAPI routes, SSE, OpenAI-compatible /v1, serves the built UI
-│   │   ├── llm_service.py        # every LLM call: routing, logging, tool turns
-│   │   ├── model.py / model_mlx.py / model_factory.py   # in-process model (CUDA or Apple Silicon)
-│   │   ├── decision_service.py   # Jev client + DecisionService (typed decisions)
-│   │   ├── guardrail_service.py  # safety checks (Jev battery, LLM fallback)
-│   │   ├── agent/
-│   │   │   ├── router.py         # needs tools? / enough? decisions
-│   │   │   ├── runner.py         # TaskAgent loop, approvals, untrusted-content guard
-│   │   │   ├── tools.py          # web_search, news_search, fetch_page, get_weather
-│   │   │   ├── sandbox.py        # Docker / local code execution, workspace cleanup
-│   │   │   ├── workspace_tools.py  # run_code, read/write/list files
-│   │   │   └── connectors.py     # MCP servers as tools
-│   │   ├── tasks/                # background task runtime (manager, SQLite store, per-turn flow)
-│   │   ├── chat_store.py         # JSON-file chat persistence
-│   │   ├── search_index.py       # SQLite FTS5 index for search
-│   │   ├── backup.py             # backup / restore zip
-│   │   ├── project_store.py / memory_store.py / settings_store.py / scheduler.py
-│   │   ├── attachments.py / context.py / usage.py / transcribe.py
-│   │   ├── config.py / logger.py
-│   │   └── providers/            # base, local, anthropic, openai(-compatible), registry
-│   ├── tests/                    # unit tests, fakes, contract suite
-│   ├── scripts/download_model.py
-│   ├── config.yaml / models.yaml / connectors.example.yaml / .env.example
-│   └── serve.py                  # Entry point: python serve.py
-├── frontend/
-│   ├── src/
-│   │   ├── App.tsx
-│   │   ├── api/client.ts
-│   │   ├── lib/                  # sse.ts, turn.ts (event reducer), preview.ts, theme.ts
-│   │   ├── components/           # ChatView, Message, Markdown, Activity, Composer, ModelMenu, Sidebar,
-│   │   │                         # ProjectView, SchedulesView, SettingsView, UsageTab, PreviewPanel, …
-│   │   ├── styles/global.css     # design tokens (light + dark) and all styles
-│   │   └── types.ts
-│   ├── package.json
-│   └── vite.config.ts            # Proxies /api, /health, /v1 to :8000
-├── start.sh / start.bat          # run both (start.sh --prod: one process)
-├── models/                       # Downloaded model weights (gitignored)
-└── README.md
-```
-
----
-
-## First-time setup
-
-### 1. Install Python dependencies
+### 1. Install
 
 ```bash
+git clone https://github.com/maxmoundas/local-llm.git
+cd local-llm
+
 cd backend
-pip install -r requirements.txt
-pip install git+https://github.com/huggingface/transformers.git
-```
+pip install -r requirements.txt          # Apple Silicon: pip install -r requirements-mac.txt
+cp .env.example .env                     # then edit .env (see below)
 
-### 2. Configure environment
-
-Copy the example and fill in your tokens:
-
-```bash
-cp backend/.env.example backend/.env
-```
-
-`backend/.env`:
-```
-# Required for local model download
-HF_TOKEN=hf_your_token_here
-
-# Optional: enables Anthropic models in the UI
-ANTHROPIC_API_KEY=sk-ant-...
-
-# Optional: enables OpenAI models in the UI
-OPENAI_API_KEY=sk-...
-
-# Optional: enables Jev for routing, safety checks, and memory gating
-TYPESAFE_API_KEY=apikey_...
-```
-
-You need a HuggingFace account with access granted to `google/gemma-4-E4B-it` at huggingface.co/google/gemma-4-E4B-it.
-
-### 3. Download the model
-
-```bash
-cd backend
-python scripts/download_model.py
-```
-
-Downloads ~5 GB to `models/` at the project root. Only runs once; subsequent starts load from disk.
-
-### 4. Install frontend dependencies
-
-```bash
-cd frontend
+cd ../frontend
 npm install
 ```
 
----
+### 2. Add your API keys
 
-## Running
+Set at least one model provider in `backend/.env` (or run Ollama or LM Studio):
 
 ```bash
-# Terminal 1
-cd backend && python serve.py
-
-# Terminal 2
-cd frontend && npm run dev
+ANTHROPIC_API_KEY=sk-ant-...     # Claude models
+OPENAI_API_KEY=sk-...            # GPT models
+TYPESAFE_API_KEY=apikey_...      # optional. Jev: fast routing, safety, and memory decisions
 ```
 
-- Backend: http://localhost:8000
-- Frontend: http://localhost:5173
+### 3. Run
 
-Or `./start.sh` to run both. For a single process without the Vite dev server (e.g. to use the app from a phone —
-see [Security](#security)), run `./start.sh --prod`: it builds the frontend and the backend serves it at
-http://localhost:8000. Set `server.frontend_dist` in `config.yaml` to serve a build from elsewhere.
+```bash
+./start.sh            # macOS / Linux / Git Bash: starts the backend and frontend
+start.bat             # Windows (cmd)
+```
 
-The backend starts accepting requests immediately. The local model loads in the background (typically 1–3 minutes depending on disk speed). Cloud models are usable right away; a loading banner in the UI indicates when the local model is still warming up.
+Open **http://localhost:5173**.
 
----
+To run a single process without the dev server, use `./start.sh --prod`. It builds the UI and serves everything at
+**http://localhost:8000**.
+
+<details>
+<summary>Running the backend and frontend separately</summary>
+
+```bash
+cd backend && python serve.py      # http://localhost:8000
+cd frontend && npm run dev         # http://localhost:5173 (proxies /api and /v1 to :8000)
+```
+
+</details>
+
+### Optional: enable the built-in local model
+
+The built-in model (Gemma 4 E4B, about 5 GB of VRAM at 4-bit) is off by default and isn't loaded until you enable it.
+
+1. Gemma is a gated model. Accept its terms at
+   [huggingface.co/google/gemma-4-E4B-it](https://huggingface.co/google/gemma-4-E4B-it), create a token at
+   [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens), and add `HF_TOKEN=hf_...` to
+   `backend/.env`.
+2. Download the weights (one time): `cd backend && python scripts/download_model.py`
+3. Set `model.enabled: true` in `backend/config.yaml` (or `LOCAL_MODEL_ENABLED=true` in `backend/.env`), then restart
+   the backend.
+
+The model loads in the background (usually 1–3 minutes), and other models work in the meantime. To free the GPU
+again, set it back to `false` and restart.
 
 ## Configuration
 
-Edit `backend/config.yaml`:
+| File | What it controls |
+|---|---|
+| `backend/.env` | API keys, optional `HF_TOKEN` / `LOCAL_MODEL_ENABLED` / `ACCESS_TOKEN` (copy from `.env.example`) |
+| `backend/config.yaml` | Built-in model (`enabled`, repo, quantization, generation settings), host and port, logging |
+| `backend/models.yaml` | Every model in the menu: providers, prices, context windows, tool-calling mode |
+| `backend/connectors.yaml` | MCP servers the agent can use (copy from `connectors.example.yaml`) |
 
-```yaml
-model:
-  repo_id: "google/gemma-4-E4B-it"
-  cache_dir: "../models"
-  quantization: "4bit"       # none | 4bit | 8bit
-  device_map: "auto"
-  max_new_tokens: 512
-  temperature: 0.7
-  top_p: 0.9
-  repetition_penalty: 1.1
+Most other options (agent limits, code sandbox, safety checks, memory, voice, usage limits) are in the app under
+**Settings**.
 
-server:
-  host: "127.0.0.1"      # "0.0.0.0" to serve your network — also set ACCESS_TOKEN (see Security)
-  port: 8000
+**Adding a local model through Ollama:** run `ollama pull qwen3:8b` and restart the backend, and the model appears
+in the menu. To test whether a new model handles the agent's tool calls, run the contract suite:
+
+```bash
+cd backend
+pytest tests/contract -m contract --model qwen3:8b -v
 ```
-
-Environment variable overrides: `MODEL_REPO_ID`, `MODEL_QUANTIZATION`, `SERVER_HOST`, `SERVER_PORT`, `LOG_LEVEL`, `ACCESS_TOKEN`, `WHISPER_MODEL`.
-
----
-
-## API reference
-
-### Chat API (used by the UI)
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/health` | Server and model load status |
-| `GET` | `/api/models` | List available models across all providers |
-| `GET` | `/api/chats` | List all chats (sorted by last activity) |
-| `POST` | `/api/chats` | Create a new chat |
-| `GET` | `/api/chats/{id}` | Get chat with full message history |
-| `POST` | `/api/chats/{id}/message` | Send a message (`attachments`: file ids); returns SSE stream |
-| `POST` | `/api/chats/{id}/regenerate` | New version of the reply at `index` (or answer the last message); SSE |
-| `POST` | `/api/chats/{id}/edit` | Replace the user message at `index` and answer it; SSE |
-| `POST` | `/api/chats/{id}/versions` | Show another version: `{ index, version }` |
-| `POST` | `/api/chats/{id}/files` | Upload an attachment `{ name, mime, data_base64 }` → metadata with `id` |
-| `GET` | `/api/chats/{id}/files/{file_id}` | Download an attachment |
-| `POST` | `/api/chats/{id}/title` | Generate a title from the conversation |
-| `GET` | `/api/chats/{id}/export?format=md\|json` | Export |
-| `GET` | `/api/search?q=` | Full-text search over all chats |
-| `PATCH` | `/api/chats/{id}` | Rename, move to a project (`project_id`), or set per-chat `settings` |
-| `DELETE` | `/api/chats/{id}` | Delete a chat |
-| `POST` | `/api/chats/{id}/pin` | Toggle pin state; returns `{ "pinned": bool }` |
-| `GET` / `PATCH` | `/api/settings` | Read / update settings (research, Jev, safety, memory, …) |
-| `GET` / `PATCH` | `/api/memory` | Read / replace the memory profile |
-| `POST` | `/api/decide` | Ask Jev typed questions: `{ "state": ..., "questions": {...} }` |
-| `GET` / `POST` | `/api/projects` | List / create projects |
-| `GET` / `PATCH` / `DELETE` | `/api/projects/{id}` | Project detail (with chats and memory) / update / delete (chats are kept) |
-| `POST` / `DELETE` | `/api/projects/{id}/files[/{file_id}]` | Add / remove knowledge files |
-| `PATCH` | `/api/projects/{id}/memory` | Replace the project's memory |
-| `GET` / `POST` | `/api/schedules` | List / create scheduled tasks |
-| `PATCH` / `DELETE` | `/api/schedules/{id}` | Update / delete; `POST /api/schedules/{id}/run` runs now |
-| `GET` | `/api/usage?days=30` | Spend and tokens by day, model, and chat; month to date |
-| `POST` | `/api/transcribe` | Speech to text: `{ audio_base64, mime }` → `{ text }` |
-| `GET` / `POST` | `/api/auth/status`, `/api/auth/login`, `/api/auth/logout` | Access-token sign-in (see Security) |
-| `GET` | `/api/backup` | Download a backup zip (chats + files, projects, memory, settings, schedules; no API keys) |
-| `POST` | `/api/restore?mode=merge\|replace` | Restore a backup zip sent as the raw body (see `src/backup.py`) |
-
-**`GET /health` response:**
-```json
-{ "status": "ok", "model": "google/gemma-4-E4B-it", "local_model_loaded": true }
-```
-`status` is `"loading"` and `local_model_loaded` is `false` while the local model is still loading into VRAM. Cloud provider endpoints are fully functional regardless.
-
-**Message request body:**
-```json
-{
-  "content": "Hello",
-  "model_id": "claude-sonnet-5-5",
-  "attachments": ["<file id from POST /api/chats/{id}/files>"]
-}
-```
-`model_id` is optional; omitting it uses the default model. Upload images and documents first with
-`POST /api/chats/{id}/files` and pass their ids in `attachments` (the older single `image_base64` field still works).
-
-### OpenAI-compatible endpoint
-
-Drop-in replacement for projects already using the OpenAI SDK — and a single local gateway to every model in
-`models.yaml`. `GET /v1/models` lists them; pass any id as `model` (`"local"` or the repo id means the in-process
-model). Calls to cloud models are metered like chat turns: they show in Usage and count toward the monthly limit.
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="local")
-response = client.chat.completions.create(
-    model="google/gemma-4-E4B-it",
-    messages=[{"role": "user", "content": "Hello"}],
-    stream=True,
-)
-for chunk in response:
-    print(chunk.choices[0].delta.content or "", end="", flush=True)
-
-# Any other configured model works the same way:
-client.chat.completions.create(model="claude-haiku-5-5", messages=[{"role": "user", "content": "Hi"}])
-```
-
-### Vision endpoint (non-streaming, local model only)
-
-```python
-import base64, requests
-
-with open("photo.jpg", "rb") as f:
-    b64 = base64.b64encode(f.read()).decode()
-
-resp = requests.post("http://localhost:8000/v1/vision",
-                     json={"image_base64": b64, "prompt": "Describe this image.", "max_new_tokens": 128})
-print(resp.json()["response"])
-```
-
----
 
 ## Security
 
-The backend listens on **127.0.0.1** by default, so only this computer can reach it. Requests must also address
-it by a loopback name (`localhost`, `127.0.0.1`), which stops web pages from reaching it through DNS rebinding, and
-state-changing requests from other web origins are refused (allowed origins: `server.cors_origins` in `config.yaml`).
+The backend listens on **127.0.0.1** by default and accepts only requests addressed to a loopback host name, which
+blocks DNS-rebinding attacks. It also refuses state-changing requests from other origins.
 
-To use the app from other devices:
+To use the app from your phone or another computer:
 
 1. Set a long random `ACCESS_TOKEN` in `backend/.env`.
 2. Set `server.host: "0.0.0.0"` in `backend/config.yaml` and restart.
 
-The browser then asks for the token once (kept in an HttpOnly, SameSite=Strict cookie). API clients send
-`Authorization: Bearer <token>` — including the OpenAI SDK: `OpenAI(base_url=..., api_key="<token>")`.
-Without a token, a non-loopback `host` still only accepts requests addressed to localhost.
+The browser asks for the token once. API clients send `Authorization: Bearer <token>`. Agent code runs in a Docker
+container (with CPU, memory, and process limits and no access to host environment variables). Previews render in
+sandboxed iframes with no access to the app. Once the agent has read web or connector content, any tool that could
+send data out pauses for your approval.
 
-HTML previews run in sandboxed iframes without same-origin access, so previewed code can't read the app or call its API.
+API keys stay in `backend/.env`, which is git-ignored and never included in backups.
 
----
+## Documentation
 
-## Scheduled tasks
+- **[Architecture](docs/architecture.md):** backend, agent loop, providers, storage, streaming events, project layout
+- **[API reference](docs/api.md):** chat API, OpenAI-compatible `/v1`, vision endpoint
+- **[Manual test prompts](docs/test-prompts.md):** prompts that exercise research, routing, safety, and memory
 
-Settings live in the **Scheduled** page. A schedule runs while the backend is running: daily at a time, on chosen
-weekdays, or every N minutes (min 5). Each run is an ordinary background turn posted to the schedule's own chat
-(created on the first run, optionally inside a project). Nobody is watching, so the agent's questions go unanswered
-and tool calls that need approval are declined. Runs missed while the backend was down run once at startup.
-
----
-
-## Adding a provider
-
-Most providers need no code: anything with an OpenAI-compatible API is an `openai_compatible` entry in `models.yaml`. For a genuinely different API, subclass `BaseProvider` (implement `models`, `stream`, `complete`, and optionally `_native_tool_turn`; prompted tool calling is inherited), record usage with `usage.record(...)`, and add a `type` branch in `build_provider()` in `src/providers/registry.py`.
-
----
-
-## Tests
+## Development
 
 ```bash
-cd backend
-pytest                                                   # unit + task-runtime tests (no GPU, no API keys)
-pytest tests/test_providers_integration.py -m integration -v   # real API calls
-pytest tests/contract -m contract --model claude-haiku-5-5 --model llama3.2:3b -v   # does a model work here?
-
-cd frontend && npm test                                  # turn reducer (vitest)
+cd backend && pytest                 # unit tests: no GPU or API keys needed
+cd frontend && npm test              # frontend tests (vitest)
+cd frontend && npx tsc -b            # type check
 ```
 
-Unit tests mock the model and all external API clients; `tests/fakes.py` has a scripted provider that runs the real agent loop deterministically. The **contract suite** checks a model against what the agent needs (instruction following, streaming + usage, tool calls, status lines, parallel calls, knowing when to stop, a full agent loop) in both native and prompted modes, and prints the recommended `tools:` setting. CI (`.github/workflows/tests.yml`) runs the backend unit tests and the frontend typecheck + tests on every push.
+CI runs both suites on every push and pull request. See [CONTRIBUTING.md](CONTRIBUTING.md) for more.
+
+## License
+
+[MIT](LICENSE) for this project's code. Model weights you download or connect to have their own licenses and terms;
+check each model's page before using it.

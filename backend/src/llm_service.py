@@ -16,7 +16,7 @@ import time
 from collections.abc import Iterator
 
 from src.logger import get_logger
-from src.providers.base import ToolTurn
+from src.providers.base import ProviderAuthError, ToolTurn, is_auth_error
 from src.providers.registry import ProviderRegistry
 
 _log = get_logger(__name__)
@@ -118,6 +118,13 @@ class LLMService:
                 pass
         return self._registry.cheapest_model.id
 
+    @staticmethod
+    def _auth_failure(provider, exc: Exception) -> ProviderAuthError | None:
+        """A rejected API key: flag the provider (utility calls then skip it) and return a clear error."""
+        if isinstance(exc, ProviderAuthError):
+            return exc
+        return ProviderAuthError(provider.mark_auth_failed()) if is_auth_error(exc) else None
+
     # ── Public interface ──────────────────────────────────────────────────
 
     def stream(
@@ -157,6 +164,9 @@ class LLMService:
         except Exception as exc:
             _log.error("[%s] error | %smodel=%s | %s",
                        call_type, ctx, _short(model_id), exc)
+            err = self._auth_failure(provider, exc)
+            if err is not None and err is not exc:
+                raise err from exc
             raise
         else:
             elapsed = time.monotonic() - t0
@@ -176,25 +186,37 @@ class LLMService:
         Uses the cheapest registered model when model_id is None, making it
         the right call for any internal utility request.
         """
-        if model_id is None:
-            model_id = self._resolve_cheapest_id()
-        provider = self._registry.get_provider(model_id)
+        utility = model_id is None
+        tried: set[str] = set()
+        while True:
+            if utility:
+                model_id = self._resolve_cheapest_id()
+            provider = self._registry.get_provider(model_id)
 
-        _log.info("[%s] start | model=%s", call_type, _short(model_id))
-        t0 = time.monotonic()
-        try:
-            if max_tokens is None:
-                result = provider.complete(messages, model_id)
-            else:
-                result = provider.complete(messages, model_id, max_tokens=max_tokens)
-            elapsed = time.monotonic() - t0
-            tokens = provider.count_tokens(result)
-            _log.info("[%s] done  | model=%s | tokens≈%d | %.1fs",
-                      call_type, _short(model_id), tokens, elapsed)
-            return result
-        except Exception as exc:
-            _log.error("[%s] error | model=%s | %s", call_type, _short(model_id), exc)
-            raise
+            _log.info("[%s] start | model=%s", call_type, _short(model_id))
+            t0 = time.monotonic()
+            try:
+                if max_tokens is None:
+                    result = provider.complete(messages, model_id)
+                else:
+                    result = provider.complete(messages, model_id, max_tokens=max_tokens)
+                elapsed = time.monotonic() - t0
+                tokens = provider.count_tokens(result)
+                _log.info("[%s] done  | model=%s | tokens≈%d | %.1fs",
+                          call_type, _short(model_id), tokens, elapsed)
+                return result
+            except Exception as exc:
+                _log.error("[%s] error | model=%s | %s", call_type, _short(model_id), exc)
+                err = self._auth_failure(provider, exc)
+                if err is None:
+                    raise
+                tried.add(model_id)
+                # A utility call (title, memory, routing…) moves on to the next ready model.
+                if utility and self._resolve_cheapest_id() not in tried:
+                    continue
+                if err is exc:
+                    raise
+                raise err from exc
 
     def complete_with_tools(
         self,
@@ -218,6 +240,9 @@ class LLMService:
             turn = provider.complete_with_tools(messages, model_id, tools, require=require)
         except Exception as exc:
             _log.error("[%s] error | %smodel=%s | %s", call_type, ctx, _short(model_id), exc)
+            err = self._auth_failure(provider, exc)
+            if err is not None and err is not exc:
+                raise err from exc
             raise
         _log.info("[%s] done  | %smodel=%s | calls=%s | %.1fs", call_type, ctx, _short(model_id),
                   [c.name for c in turn.tool_calls], time.monotonic() - t0)

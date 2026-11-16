@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.backends.legacy:build"
+requires = ["setuptools>=84.1.0"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "local-llm-backend"
@@ -10,6 +10,8 @@ requires-python = ">=3.11"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Opt-in suites (real API calls / model checks) run only when selected explicitly with -m.
+addopts = "-m 'not integration and not contract'"
 log_cli = true
 log_cli_level = "WARNING"
 markers = [

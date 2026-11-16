@@ -73,8 +73,10 @@ function Shell() {
       setModels(ms)
       const saved = load(MODEL_KEY)
       // With no saved choice, default to a cloud model: usable immediately, while local takes minutes to load.
-      const fallback = ms.find(m => m.provider !== 'local') ?? ms[0]
-      setModelId(ms.some(m => m.id === saved) ? saved! : fallback?.id ?? '')
+      // Skip models that can't be used (e.g. a rejected API key).
+      const usable = ms.filter(m => !m.error)
+      const fallback = usable.find(m => m.provider !== 'local') ?? usable[0] ?? ms[0]
+      setModelId(usable.some(m => m.id === saved) ? saved! : fallback?.id ?? '')
     })
     api.getSettings().then(s => {
       setDisplayName(s.display_name ?? '')
@@ -92,9 +94,13 @@ function Shell() {
 
   useEffect(() => {
     if (localModelLoaded) return
-    const check = () => api.health().then(h => { if (h.local_model_loaded) setLocalModelLoaded(true) }).catch(() => {})
+    let id: ReturnType<typeof setInterval> | undefined
+    const check = () => api.health().then(h => {
+      if (h.local_model_loaded) setLocalModelLoaded(true)
+      else if (h.local_model_enabled === false) clearInterval(id)  // turned off: it will never load
+    }).catch(() => {})
     check()
-    const id = setInterval(check, 3000)
+    id = setInterval(check, 3000)
     return () => clearInterval(id)
   }, [localModelLoaded])
 

@@ -1,4 +1,8 @@
 model:
+  # Built-in local model (loaded in-process onto your GPU). Off by default: when false, it is never loaded,
+  # uses no GPU memory, and doesn't appear in the model menu. Set to true (or LOCAL_MODEL_ENABLED=true) to use it;
+  # download the weights first with: python scripts/download_model.py
+  enabled: false
   repo_id: "google/gemma-4-E4B-it"
   cache_dir: "../models"
   # 4bit: ~5 GB for Gemma 4 E4B (fits 8 GB VRAM); 8bit or none need more

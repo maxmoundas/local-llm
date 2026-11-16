@@ -64,13 +64,14 @@ from src.agent import sandbox as sb
 from src.agent.sandbox import Sandbox, detect_sandbox, safe_path
 from src.attachments import AttachmentError
 from src.agent.tools import default_tools
-from src.config import load_config
+from src.config import load_config, local_model_enabled
 from src.decision_service import CALL_TYPE_MEMORY, DecisionError, DecisionService, noul
 from src.guardrail_service import GuardrailService
 from src.llm_service import LLMService
 from src.logger import get_logger, setup_logging
 from src.model_factory import create_local_llm
 from src.providers import ProviderRegistry, build_registry
+from src.providers.registry import check_api_keys
 from src.providers.base import EFFORT_LEVELS
 from src.settings_store import DEFAULT_GUARDRAIL_PROMPT, DEFAULT_SYSTEM_PROMPT
 from src.tasks import store as task_store
@@ -196,7 +197,11 @@ async def lifespan(app: FastAPI):
     cfg = load_config()
     setup_logging(cfg)
     logger.info("Starting backend")
-    _llm = create_local_llm(cfg)
+    if local_model_enabled(cfg):
+        _llm = create_local_llm(cfg)
+    else:
+        _llm = None  # never created, so nothing is loaded onto the GPU
+        logger.info("Local model disabled (model.enabled: false in config.yaml) — not loading it")
     _registry = build_registry(_llm)
     saved_settings = settings_store.load()
     _llm_service = LLMService(_registry, cheapest_model_id=saved_settings.get("cheapest_model_id"))
@@ -209,7 +214,9 @@ async def lifespan(app: FastAPI):
                 cheapest.name, cheapest.id,
                 "on" if _decision_svc.available else ("off" if _decision_svc.configured else "no key"),
                 "on" if _agent else "off", _sandbox.name if _sandbox else "off")
-    threading.Thread(target=_llm.load, daemon=True, name="model-loader").start()
+    if _llm is not None:
+        threading.Thread(target=_llm.load, daemon=True, name="model-loader").start()
+    threading.Thread(target=check_api_keys, args=(_registry,), daemon=True, name="key-check").start()
     threading.Thread(target=_start_connectors, daemon=True, name="connectors-start").start()
     threading.Thread(target=_housekeeping, daemon=True, name="housekeeping").start()
     global _scheduler
@@ -327,7 +334,8 @@ async def _invalid_chat_id(request: Request, exc: chat_store.InvalidChatId) -> J
 
 def _require_llm() -> LocalLLM:
     if _llm is None or not _llm.is_loaded:
-        raise HTTPException(503, "Model not loaded yet — try again in a moment")
+        raise HTTPException(503, "The local model is turned off (model.enabled in config.yaml)" if _llm is None
+                            else "Model not loaded yet — try again in a moment")
     return _llm
 
 
@@ -442,7 +450,14 @@ def _maybe_update_memory(user_message: str, svc: LLMService, prev_reply: str = "
 
 
 def _model_dicts(registry: ProviderRegistry) -> list[dict]:
-    return [m.public() for m in registry.list_models()]
+    out = []
+    for m in registry.list_models():
+        d = m.public()
+        error = registry.get_provider(m.id).auth_error
+        if error:
+            d["error"] = error  # e.g. a rejected API key; the model menu shows it unavailable
+        out.append(d)
+    return out
 
 
 # ── Health & model discovery ───────────────────────────────────────────
@@ -451,7 +466,8 @@ def _model_dicts(registry: ProviderRegistry) -> list[dict]:
 async def health() -> dict[str, Any]:
     loaded = _llm is not None and _llm.is_loaded
     return {
-        "status": "ok" if loaded else "loading",
+        "status": "ok" if loaded or _llm is None else "loading",
+        "local_model_enabled": _llm is not None,
         "model": _llm.repo_id if _llm else None,
         "local_model_loaded": loaded,
         "jev_available": bool(_decision_svc and _decision_svc.available),

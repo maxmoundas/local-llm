@@ -43,29 +43,37 @@ class ProviderRegistry:
             raise KeyError(f"Unknown model: {model_id}")
         return model
 
+    def _automatic(self) -> list[BaseProvider]:
+        """Providers the app may pick on its own. The in-process local model is only used when chosen
+        explicitly (model menu, or the utility-model setting), or when nothing else is configured."""
+        others = [p for p in self._providers if p.provider_name != "local"]
+        return others or list(self._providers)
+
     @property
     def default_model_id(self) -> str:
-        return self._providers[0].models[0].id
+        """Model for requests that don't name one: the first ready automatic model."""
+        candidates = self._automatic()
+        ready = [p for p in candidates if p.ready] or candidates
+        return ready[0].models[0].id
 
     @property
     def cheapest_model(self) -> ModelOption:
-        """Return the first is_cheapest model whose provider is ready, in registration order.
-
-        Providers register in catalog order (local first), so the free local model is used once
-        its weights are loaded, and a cloud cheap model covers until then.
-        Then the cheapest ready model of any kind, then the first flagged model, then the default.
+        """Model for utility calls (titles, memory, routing): the first ready is_cheapest model in
+        registration order, then the cheapest ready model of any kind, then the first flagged model,
+        then the default. The local model is skipped unless nothing else is configured.
         """
-        flagged = [(p, m) for p in self._providers for m in p.models if m.is_cheapest]
+        providers = self._automatic()
+        flagged = [(p, m) for p in providers for m in p.models if m.is_cheapest]
         for provider, model in flagged:
             if provider.ready:
                 return model
         # No flagged model can serve right now: use the cheapest one that can (e.g. an Ollama model).
-        ready = [m for p in self._providers if p.ready for m in p.models]
+        ready = [m for p in providers if p.ready for m in p.models]
         if ready:
             return min(ready, key=lambda m: m.input_price + m.output_price)
         if flagged:
             return flagged[0][1]
-        return self._providers[0].models[0]
+        return providers[0].models[0]
 
 
 # ── catalog loading ───────────────────────────────────────────────────────
@@ -124,6 +132,15 @@ def build_provider(name: str, spec: dict, llm=None) -> BaseProvider | None:
     raise ValueError(f"models.yaml: provider {name!r} has unknown type {kind!r}")
 
 
+def check_api_keys(registry: ProviderRegistry) -> None:
+    """Verify each provider's API key (a model listing, no tokens), so a bad key is flagged before first use."""
+    for provider in registry.providers:
+        try:
+            provider.check_auth()
+        except Exception as exc:  # a check must never take the app down
+            _log.info("API key check failed for %s: %s", provider.provider_name, exc)
+
+
 def build_registry(llm, catalog_path: Path | str | None = None) -> ProviderRegistry:
     """Register every usable provider from models.yaml, in file order."""
     registry = ProviderRegistry()
@@ -134,8 +151,10 @@ def build_registry(llm, catalog_path: Path | str | None = None) -> ProviderRegis
             _log.error("Could not set up provider %s: %s", name, exc)
             continue
         if provider is not None and provider.models:
+            provider.api_key_env = (spec or {}).get("api_key_env")
             registry.register(provider)
             _log.info("Provider %s: %s", name, ", ".join(m.id for m in provider.models))
     if not registry.providers:
-        raise RuntimeError("No model providers available — check models.yaml and your API keys")
+        raise RuntimeError("No models available. Add an API key to backend/.env, start Ollama or LM Studio, "
+                           "or enable the local model (model.enabled: true in config.yaml).")
     return registry

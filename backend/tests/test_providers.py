@@ -93,10 +93,11 @@ class TestLocalProvider:
         p = LocalProvider(mock_llm)
         assert "/" not in p.models[0].name
 
-    def test_is_cheapest_true(self, mock_llm):
+    def test_not_flagged_cheapest(self, mock_llm):
+        # The local model is never picked automatically for utility calls; only when chosen explicitly.
         from src.providers.local import LocalProvider
         p = LocalProvider(mock_llm)
-        assert p.models[0].is_cheapest is True
+        assert p.models[0].is_cheapest is False
 
     def test_stream_delegates_to_llm(self, mock_llm):
         from src.providers.local import LocalProvider
@@ -656,9 +657,36 @@ class TestCheapestModelReadiness:
 
     def test_prefers_first_ready_provider(self):
         registry = ProviderRegistry()
+        registry.register(self._provider("anthropic", "haiku", ready=True))
+        registry.register(self._provider("openai", "mini", ready=True))
+        assert registry.cheapest_model.id == "haiku"
+
+    def test_local_model_not_picked_automatically(self):
+        registry = ProviderRegistry()
         registry.register(self._provider("local", "gemma", ready=True))
         registry.register(self._provider("anthropic", "haiku", ready=True))
+        assert registry.cheapest_model.id == "haiku"
+        assert registry.default_model_id == "haiku"
+
+    def test_default_model_skips_unready_provider(self):
+        registry = ProviderRegistry()
+        registry.register(self._provider("local", "gemma", ready=True))
+        registry.register(self._provider("anthropic", "haiku", ready=False))
+        registry.register(self._provider("openai", "mini", ready=True))
+        assert registry.default_model_id == "mini"
+
+    def test_local_model_used_when_it_is_the_only_one(self):
+        registry = ProviderRegistry()
+        registry.register(self._provider("local", "gemma", ready=True))
         assert registry.cheapest_model.id == "gemma"
+        assert registry.default_model_id == "gemma"
+
+    def test_explicit_local_override_is_honoured(self):
+        from src.llm_service import LLMService
+        registry = ProviderRegistry()
+        registry.register(self._provider("local", "gemma", ready=True))
+        registry.register(self._provider("anthropic", "haiku", ready=True))
+        assert LLMService(registry, cheapest_model_id="gemma")._resolve_cheapest_id() == "gemma"
 
     def test_falls_back_to_first_flagged_when_none_ready(self):
         registry = ProviderRegistry()

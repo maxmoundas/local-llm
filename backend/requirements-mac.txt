@@ -6,7 +6,7 @@ mlx>=0.16.0
 mlx-lm>=0.16.0
 
 # Image handling (cloud vision providers still supported)
-Pillow>=10.0.0
+Pillow>=13.0.0  # 12.x has critical image-decoder CVEs
 
 # Cloud providers (registered automatically when API keys are present in .env)
 anthropic>=0.40.0
@@ -23,7 +23,7 @@ huggingface_hub>=0.25.0
 mcp>=1.10
 
 # Attachments: text from PDFs, Word, and Excel files
-pypdf>=4.0
+pypdf>=6.21.4  # older versions have high-severity parsing CVEs
 python-docx>=1.1
 openpyxl>=3.1
 
@@ -47,3 +47,12 @@ typer>=0.13.0
 pytest>=8.0.0
 pytest-asyncio>=0.24.0
 httpx>=0.27.0
+
+# Security floors for transitive dependencies (known critical/high advisories below these versions)
+anyio>=4.14.2
+certifi>=2026.10.18
+urllib3>=2.8.0
+starlette>=1.3.1
+fsspec>=2026.6.0
+filelock>=3.20.3
+idna>=3.15

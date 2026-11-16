@@ -93,6 +93,16 @@ class TestPlanAndQuestions:
         assert all(a["tool"] != "update_plan" for a in _actions(events))
         assert "1. find it\n2. summarize" in p.seen[1][1]["content"]
 
+    def test_turn_after_plan_must_act(self):
+        # Regression: a model re-planning every turn used up all steps without calling a real tool.
+        p = ScriptedProvider(turns=[calls(("update_plan", {"steps": ["search"]})),
+                                    calls(("lookup", {"q": "x"})), ToolTurn()])
+        events, _ = _run(p, [_tool()])
+        assert "update_plan" in {t["name"] for t in p.seen_tools[0]}
+        assert "update_plan" not in {t["name"] for t in p.seen_tools[1]}
+        assert "update_plan" in {t["name"] for t in p.seen_tools[2]}  # offered again once it acted
+        assert [a["tool"] for a in _actions(events) if a["status"] == "done"] == ["lookup"]
+
     def test_ask_user_offered_only_with_handler(self):
         p = ScriptedProvider(turns=[ToolTurn()])
         _run(p, [_tool()])

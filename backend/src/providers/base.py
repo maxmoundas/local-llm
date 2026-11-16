@@ -67,6 +67,15 @@ class RefusalError(RuntimeError):
     """The model declined the request (e.g. a safety classifier)."""
 
 
+class ProviderAuthError(RuntimeError):
+    """The provider rejected its API key. The provider is marked unavailable until the backend restarts."""
+
+
+def is_auth_error(exc: BaseException) -> bool:
+    """True for an HTTP 401 from a provider SDK (anthropic and openai errors both carry `status_code`)."""
+    return getattr(exc, "status_code", None) == 401
+
+
 # Appended to the system prompt by the default (prompted) tool-calling implementation.
 _PROMPTED_TOOLS_TEMPLATE = """
 
@@ -210,10 +219,41 @@ class BaseProvider(ABC):
             turn = parse_prompted_tool_turn(self.complete(repair, model_id), names)
         return turn
 
+    # Set when the provider rejects its API key, so utility calls skip it and the UI can say why.
+    _auth_error: str | None = None
+    # Env var holding the key, for error messages (set by build_provider).
+    api_key_env: str | None = None
+
     @property
     def ready(self) -> bool:
-        """False while the provider can't serve requests (e.g. local weights still loading)."""
-        return True
+        """False while the provider can't serve requests (local weights still loading, rejected API key)."""
+        return self._auth_error is None
+
+    @property
+    def auth_error(self) -> str | None:
+        return self._auth_error
+
+    def mark_auth_failed(self) -> str:
+        """Record a rejected API key and return a message that says how to fix it."""
+        where = f"{self.api_key_env} in backend/.env" if self.api_key_env else "the API key in backend/.env"
+        label = {"anthropic": "Anthropic", "openai": "OpenAI"}.get(self.provider_name, self.provider_name)
+        msg = f"The {label} API rejected its key. Check {where}, then restart the backend."
+        if self._auth_error is None:
+            _log.error(msg)
+        self._auth_error = msg
+        return msg
+
+    def check_auth(self) -> None:
+        """Cheaply verify the API key at startup (no tokens spent). Providers without keys do nothing."""
+
+    def _probe_auth(self, list_models) -> None:
+        try:
+            list_models()
+        except Exception as exc:
+            if is_auth_error(exc):
+                self.mark_auth_failed()
+            else:  # offline, rate-limited… don't block the provider on a failed check
+                _log.info("API key check skipped for %s: %s", self.provider_name, exc)
 
     def count_tokens(self, text: str) -> int:
         return max(1, len(text) // 4)

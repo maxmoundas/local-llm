@@ -70,7 +70,8 @@ class TestEventLog:
 
     def test_persisted_without_tokens_and_served_after_eviction(self, monkeypatch):
         import src.tasks.manager as m
-        monkeypatch.setattr(m, "_KEEP_FINISHED_S", 0)
+        # -1, not 0: Windows' monotonic clock ticks every ~16 ms, so "now - finished_at" is often exactly 0.
+        monkeypatch.setattr(m, "_KEEP_FINISHED_S", -1)
         mgr = TaskManager()
         tid = mgr.start("c", "m", lambda ctx: [ctx.emit("status", text="a"), ctx.emit("token", content="x")])
         _drain(mgr, tid)

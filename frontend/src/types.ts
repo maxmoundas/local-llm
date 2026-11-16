@@ -179,6 +179,7 @@ export interface UsageReport {
 export interface HealthStatus {
   status: 'ok' | 'loading'
   model: string | null
+  local_model_enabled?: boolean  // false when the built-in model is turned off (never loads)
   local_model_loaded: boolean
   jev_available: boolean
 }
@@ -196,6 +197,7 @@ export interface ModelOption {
   output_price?: number
   temperature?: boolean   // accepts a sampling temperature
   effort?: boolean        // accepts a reasoning-effort level
+  error?: string          // why the model can't be used right now (e.g. a rejected API key)
 }
 
 export interface AppSettings {

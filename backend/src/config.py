@@ -20,8 +20,14 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     return cfg
 
 
+def local_model_enabled(cfg: dict[str, Any]) -> bool:
+    """Whether the built-in local model should be created and loaded (off unless enabled)."""
+    return bool((cfg.get("model") or {}).get("enabled", False))
+
+
 def _apply_env_overrides(cfg: dict) -> None:
     env_map = {
+        "LOCAL_MODEL_ENABLED": ("model", "enabled"),
         "MODEL_REPO_ID": ("model", "repo_id"),
         "MODEL_CACHE_DIR": ("model", "cache_dir"),
         "MODEL_QUANTIZATION": ("model", "quantization"),
@@ -37,7 +43,9 @@ def _apply_env_overrides(cfg: dict) -> None:
             target = cfg.setdefault(section, {})
             # Preserve type of the original value
             original = target.get(key)
-            if isinstance(original, int):
+            if isinstance(original, bool) or key == "enabled":  # bool before int: bool is an int subclass
+                target[key] = val.strip().lower() in ("1", "true", "yes", "on")
+            elif isinstance(original, int):
                 target[key] = int(val)
             elif isinstance(original, float):
                 target[key] = float(val)

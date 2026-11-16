@@ -1,14 +1,14 @@
 # Unit tests only — no GPU stack. CPU torch keeps the CUDA-backend tests runnable.
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch>=2.1.0
-transformers>=4.47.0
-Pillow>=10.0.0
+transformers>=5.5.0  # Gemma 4 support
+Pillow>=13.0.0  # 12.x has critical image-decoder CVEs
 anthropic>=0.40.0
 openai>=1.50.0
 ddgs>=9.0
 mcp>=1.10
 lxml>=5.0
-pypdf>=4.0
+pypdf>=6.21.4  # older versions have high-severity parsing CVEs
 python-docx>=1.1
 openpyxl>=3.1
 fastapi>=0.115.0
@@ -19,3 +19,12 @@ python-dotenv>=1.0.0
 httpx>=0.27.0
 pytest>=8.0.0
 pytest-asyncio>=0.24.0
+
+# Security floors for transitive dependencies (known critical/high advisories below these versions)
+anyio>=4.14.2
+certifi>=2026.10.18
+urllib3>=2.8.0
+starlette>=1.3.1
+fsspec>=2026.6.0
+filelock>=3.20.3
+idna>=3.15

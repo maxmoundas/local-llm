@@ -52,6 +52,9 @@ class AnthropicProvider(BaseProvider):
                     opts["context_window"] = ctx
                 self._models.append(ModelOption(id=item.id, name=name, provider="anthropic", **opts))
 
+    def check_auth(self) -> None:
+        self._probe_auth(lambda: self._client.with_options(timeout=5.0, max_retries=0).models.list(limit=1))
+
     @property
     def provider_name(self) -> str:
         return "anthropic"
